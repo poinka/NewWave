@@ -1,0 +1,16 @@
+torch
+torchvision
+torchaudio
+transformers==4.50.0
+
+datasets
+mlflow
+yt-dlp
+librosa
+soundfile
+evaluate
+accelerate==0.34.2
+
+huggingface_hub[hf_xet]
+torchcodec
+jupyter-server-proxy
