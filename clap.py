@@ -1,7 +1,7 @@
-"""Minimal CLAP fine-tuning harness focused  on MusicCaps."""
 from __future__ import annotations
 
 import random
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,10 +18,13 @@ from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoProcessor, ClapModel
 import yt_dlp
+from yt_dlp.utils import DownloadError
+from tqdm.auto import tqdm
 
-# -----------------------------------------------------------------------------
-# Global configuration
-# -----------------------------------------------------------------------------
+try:
+    import browser_cookie3
+except ImportError:
+    browser_cookie3 = None
 
 MODEL_NAME: str = "laion/clap-htsat-unfused"
 RANDOM_SEED: int = 42
@@ -32,9 +35,8 @@ TRAIN_BATCH_SIZE: int = 22
 EVAL_BATCH_SIZE: int = 2
 LEARNING_RATE: float = 1e-5
 WEIGHT_DECAY: float = 1e-4
-NUM_EPOCHS: int = 1
-VALIDATION_EVERY_STEPS: int = 10
-MAX_STEPS: int = 50
+NUM_EPOCHS: int = 10
+TRAIN_LOG_EVERY_STEPS: int = 10
 GRADIENT_ACCUMULATION_STEPS: int = 1
 AUDIO_CACHE_DIR: Path = Path("data/musiccaps/audio")
 MUSICCAPS_DATASET: str = "google/musiccaps"
@@ -44,21 +46,21 @@ INFERENCE_TOPK: int = 3
 MLFLOW_TRACKING_URI: str = "file:mlruns"
 MLFLOW_EXPERIMENT_NAME: str = "musiccaps_clap"
 MLFLOW_RUN_NAME: str = "clap_musiccaps_run"
+MLFLOW_AUTO_LAUNCH_UI: bool = True
+MLFLOW_UI_PORT: int = 5050
 
-# yt-dlp download behaviour (set these before running main)
+CHECKPOINT_DIR: Path = Path("checkpoints")
+BEST_CHECKPOINT_DIR: Path = CHECKPOINT_DIR / "best"
+RESUME_TRAINING: bool = True
+
 YTDLP_DOWNLOAD_ARCHIVE: Optional[Path] = AUDIO_CACHE_DIR.parent / "youtube_download_archive.txt"
-YTDLP_COOKIES_FROM_BROWSER: Optional[str] = "chrome"  # e.g. "chrome", "firefox"; leave None to skip
-YTDLP_COOKIES_FILE: Optional[Path] = None  # path to exported cookies.txt if not using browser picker
-YTDLP_SLEEP_INTERVAL: Optional[float] = 5.0  # seconds; set None to disable throttling
+YTDLP_COOKIES_FROM_BROWSER: Optional[str] = "chrome"
+YTDLP_COOKIES_FILE: Optional[Path] = None
+YTDLP_SLEEP_INTERVAL: Optional[float] = 5.0
 YTDLP_MAX_SLEEP_INTERVAL: Optional[float] = 10.0
 YTDLP_MAX_RETRIES: int = 10
 YTDLP_FRAGMENT_RETRIES: int = 10
 YTDLP_MAX_WORKERS: int = 4
-
-# -----------------------------------------------------------------------------
-# Utility helpers
-# -----------------------------------------------------------------------------
-
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -75,9 +77,37 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-# -----------------------------------------------------------------------------
-# MusicCaps preparation
-# -----------------------------------------------------------------------------
+def launch_mlflow_ui(tracking_uri: str) -> Optional[subprocess.Popen]:
+    if not MLFLOW_AUTO_LAUNCH_UI:
+        return None
+    if not tracking_uri.startswith("file:"):
+        print("MLflow UI launch skipped: tracking URI is not a local file store.")
+        return None
+    backend_root = Path(tracking_uri[5:]).resolve()
+    backend_root.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "mlflow",
+        "ui",
+        "--backend-store-uri",
+        str(backend_root),
+        "--host",
+        "127.0.0.1",
+        "--port",
+        str(MLFLOW_UI_PORT),
+    ]
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        print(f"MLflow UI available at http://127.0.0.1:{MLFLOW_UI_PORT}")
+        return proc
+    except FileNotFoundError:
+        print("mlflow CLI not found in PATH; UI launch skipped.")
+    except OSError as exc:
+        print(f"Failed to launch MLflow UI: {exc}")
+    return None
 
 
 @dataclass
@@ -95,61 +125,87 @@ def load_musiccaps_metadata(sample_limit: Optional[int] = None) -> List[Dict[str
     return [dataset[i] for i in range(sample_limit)]
 
 
-def download_audio(ytid: str, start_s: float) -> Path:
-    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+# def download_audio(ytid: str, start_s: float) -> Optional[Path]:
+#     AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+#     clip_path = AUDIO_CACHE_DIR / f"{ytid}_{int(start_s)}.wav"
+#     if clip_path.exists():
+#         return clip_path
+#     temp_template = str(AUDIO_CACHE_DIR / f"{ytid}.%(ext)s")
+#     ydl_opts = {
+#         "outtmpl": temp_template,
+#         "format": "bestaudio/best",
+#         "quiet": True,
+#         "no_warnings": True,
+#         "ignoreerrors": False,
+#         "retries": YTDLP_MAX_RETRIES,
+#         "fragment_retries": YTDLP_FRAGMENT_RETRIES,
+#         "retry_sleep_functions": {"http": lambda n: 2 ** (n - 1)},  # экспоненциальное ожидание
+#     }
+#     if YTDLP_SLEEP_INTERVAL is not None:
+#         ydl_opts["sleep_interval"] = YTDLP_SLEEP_INTERVAL
+#         if YTDLP_MAX_SLEEP_INTERVAL is not None:
+#             ydl_opts["max_sleep_interval"] = max(YTDLP_SLEEP_INTERVAL, YTDLP_MAX_SLEEP_INTERVAL)
+#     if YTDLP_DOWNLOAD_ARCHIVE is not None:
+#         YTDLP_DOWNLOAD_ARCHIVE.parent.mkdir(parents=True, exist_ok=True)
+#         ydl_opts["download_archive"] = str(YTDLP_DOWNLOAD_ARCHIVE)
+#     if YTDLP_COOKIES_FROM_BROWSER:
+#         if browser_cookie3 is None:
+#             raise RuntimeError(
+#                 "browser-cookie3 is required for YTDLP_COOKIES_FROM_BROWSER; install it via "
+#                 "'python -m pip install browser-cookie3' or disable browser cookies."
+#             )
+#         ydl_opts["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER, None, None, None)
+#     elif YTDLP_COOKIES_FILE:
+#         YTDLP_COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
+#         ydl_opts["cookiefile"] = str(YTDLP_COOKIES_FILE)
+#     url = f"https://www.youtube.com/watch?v={ytid}"
+#     try:
+#         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+#             result = ydl.extract_info(url, download=True)
+#             downloaded_path = Path(ydl.prepare_filename(result))
+#     except DownloadError as exc:
+#         print(f"[yt-dlp] skip {ytid}: {exc}")
+#         return None
+#     except Exception as exc:  # pragma: no cover - resilience for unexpected extractor errors
+#         print(f"[yt-dlp] unexpected error for {ytid}: {exc}")
+#         return None
+#     try:
+#         subprocess.run(
+#             [
+#                 "ffmpeg",
+#                 "-hide_banner",
+#                 "-loglevel",
+#                 "error",
+#                 "-y",
+#                 "-ss",
+#                 str(start_s),
+#                 "-t",
+#                 str(CLIP_SECONDS),
+#                 "-i",
+#                 str(downloaded_path),
+#                 "-ar",
+#                 str(AUDIO_SAMPLING_RATE),
+#                 "-ac",
+#                 "1",
+#                 str(clip_path),
+#             ],
+#             check=True,
+#         )
+#     except subprocess.CalledProcessError as exc:
+#         print(f"[ffmpeg] failed to trim {ytid}: {exc}")
+#         return None
+#     finally:
+#         if 'downloaded_path' in locals() and downloaded_path.exists():
+#             downloaded_path.unlink(missing_ok=True)
+#     return clip_path
+
+
+def download_audio(ytid: str, start_s: float) -> Optional[Path]:
+    """Offline placeholder while YouTube downloads are disabled."""
     clip_path = AUDIO_CACHE_DIR / f"{ytid}_{int(start_s)}.wav"
     if clip_path.exists():
         return clip_path
-    temp_template = str(AUDIO_CACHE_DIR / f"{ytid}.%(ext)s")
-    ydl_opts = {
-        "outtmpl": temp_template,
-        "format": "bestaudio/best",
-        "quiet": True,
-        "no_warnings": True,
-        "ignoreerrors": False,
-        "retries": YTDLP_MAX_RETRIES,
-        "fragment_retries": YTDLP_FRAGMENT_RETRIES,
-        "retry_sleep_functions": {"http": lambda n: 2 ** (n - 1)},  # экспоненциальное ожидание
-    }
-    if YTDLP_SLEEP_INTERVAL is not None:
-        ydl_opts["sleep_interval"] = YTDLP_SLEEP_INTERVAL
-        if YTDLP_MAX_SLEEP_INTERVAL is not None:
-            ydl_opts["max_sleep_interval"] = max(YTDLP_SLEEP_INTERVAL, YTDLP_MAX_SLEEP_INTERVAL)
-    if YTDLP_DOWNLOAD_ARCHIVE is not None:
-        YTDLP_DOWNLOAD_ARCHIVE.parent.mkdir(parents=True, exist_ok=True)
-        ydl_opts["download_archive"] = str(YTDLP_DOWNLOAD_ARCHIVE)
-    if YTDLP_COOKIES_FROM_BROWSER:
-        ydl_opts["cookiesfrombrowser"] = (YTDLP_COOKIES_FROM_BROWSER, None, None, None)
-    elif YTDLP_COOKIES_FILE:
-        YTDLP_COOKIES_FILE.parent.mkdir(parents=True, exist_ok=True)
-        ydl_opts["cookiefile"] = str(YTDLP_COOKIES_FILE)
-    url = f"https://www.youtube.com/watch?v={ytid}"
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        result = ydl.extract_info(url, download=True)
-        downloaded_path = Path(ydl.prepare_filename(result))
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "error",
-            "-y",
-            "-ss",
-            str(start_s),
-            "-t",
-            str(CLIP_SECONDS),
-            "-i",
-            str(downloaded_path),
-            "-ar",
-            str(AUDIO_SAMPLING_RATE),
-            "-ac",
-            "1",
-            str(clip_path),
-        ],
-        check=True,
-    )
-    downloaded_path.unlink()
-    return clip_path
+    return None
 
 
 def prepare_musiccaps_samples(sample_limit: Optional[int] = None) -> List[MusicCapsSample]:
@@ -160,7 +216,7 @@ def prepare_musiccaps_samples(sample_limit: Optional[int] = None) -> List[MusicC
     }
 
     existing_samples: List[MusicCapsSample] = []
-    rows_to_fetch: List[Dict[str, str]] = []
+    # rows_to_fetch: List[Dict[str, str]] = []
     for row in ordered_rows:
         clip_path = AUDIO_CACHE_DIR / f"{row['ytid']}_{int(row['start_s'])}.wav"
         if clip_path.exists():
@@ -172,27 +228,29 @@ def prepare_musiccaps_samples(sample_limit: Optional[int] = None) -> List[MusicC
                     audio_path=clip_path,
                 )
             )
-        else:
-            rows_to_fetch.append(row)
+        # else:
+        #     rows_to_fetch.append(row)
 
-    def fetch(row: Dict[str, str]) -> Optional[MusicCapsSample]:
-        path = download_audio(row["ytid"], row["start_s"])
-        return MusicCapsSample(
-            ytid=row["ytid"],
-            start_s=row["start_s"],
-            text=row["caption"],
-            audio_path=path,
-        )
+    # def fetch(row: Dict[str, str]) -> Optional[MusicCapsSample]:
+    #     path = download_audio(row["ytid"], row["start_s"])
+    #     if path is None:
+    #         return None
+    #     return MusicCapsSample(
+    #         ytid=row["ytid"],
+    #         start_s=row["start_s"],
+    #         text=row["caption"],
+    #         audio_path=path,
+    #     )
 
     fetched_samples: List[MusicCapsSample] = []
-    if rows_to_fetch:
-        worker_count = max(1, YTDLP_MAX_WORKERS)
-        with ThreadPoolExecutor(max_workers=worker_count) as executor:
-            future_map = {executor.submit(fetch, row): row for row in rows_to_fetch}
-            for future in as_completed(future_map):
-                result = future.result()
-                if result is not None:
-                    fetched_samples.append(result)
+    # if rows_to_fetch:
+    #     worker_count = max(1, YTDLP_MAX_WORKERS)
+    #     with ThreadPoolExecutor(max_workers=worker_count) as executor:
+    #         future_map = {executor.submit(fetch, row): row for row in rows_to_fetch}
+    #         for future in as_completed(future_map):
+    #             result = future.result()
+    #             if result is not None:
+    #                 fetched_samples.append(result)
 
     all_samples = existing_samples + fetched_samples
     all_samples.sort(key=lambda sample: order_index[(sample.ytid, float(sample.start_s))])
@@ -229,12 +287,6 @@ class MusicCapsDataset(Dataset):
         tensor = torch.from_numpy(audio.astype(np.float32))
         return {"audio": tensor, "text": sample.text}
 
-
-# -----------------------------------------------------------------------------
-# Training and evaluation
-# -----------------------------------------------------------------------------
-
-
 def collate_fn(batch: Sequence[Dict[str, torch.Tensor]], processor: AutoProcessor) -> Dict[str, torch.Tensor]:
     audios = [item["audio"].numpy() for item in batch]
     texts = [item["text"] for item in batch]
@@ -261,55 +313,164 @@ class Metrics:
     accuracy: float
 
 
-def evaluate(model: ClapModel, loader: DataLoader, device: torch.device) -> Metrics:
+def evaluate(
+    model: ClapModel,
+    loader: DataLoader,
+    device: torch.device,
+    *,
+    desc: Optional[str] = None,
+) -> Metrics:
     model.eval()
     total_loss = 0.0
     total_accuracy = 0.0
     steps = 0
+    progress_desc = desc or "Validation"
+    try:
+        total_batches: Optional[int] = len(loader)
+    except TypeError:
+        total_batches = None
+    progress_bar = tqdm(
+        loader,
+        desc=progress_desc,
+        unit="batch",
+        leave=False,
+        total=total_batches,
+    )
     with torch.no_grad():
-        for batch in loader:
+        for batch in progress_bar:
             batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch, return_loss=True)
             total_loss += outputs.loss.item()
             total_accuracy += compute_accuracy(outputs.logits_per_text)
             steps += 1
+            avg_loss = total_loss / steps
+            avg_accuracy = total_accuracy / steps
+            progress_bar.set_postfix(
+                loss=f"{avg_loss:.4f}",
+                acc=f"{avg_accuracy:.4f}",
+            )
+    progress_bar.close()
+    if steps == 0:
+        return Metrics(loss=0.0, accuracy=0.0)
     return Metrics(loss=total_loss / steps, accuracy=total_accuracy / steps)
 
 
-def train(model: ClapModel, processor: AutoProcessor, train_loader: DataLoader, val_loader: DataLoader, device: torch.device) -> None:
+def save_checkpoint(
+    model: ClapModel,
+    processor: AutoProcessor,
+    target_dir: Path,
+) -> None:
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(target_dir)
+    processor.save_pretrained(target_dir)
+    print(f"Saved checkpoint: {target_dir}")
+
+
+def train(
+    model: ClapModel,
+    processor: AutoProcessor,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    device: torch.device,
+    initial_best_val_accuracy: Optional[float] = None,
+    initial_global_step: int = 0,
+) -> float:
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     model.to(device)
-    global_step = 0
-    for epoch in range(NUM_EPOCHS):
+    best_val_accuracy = (
+        initial_best_val_accuracy if initial_best_val_accuracy is not None else -float("inf")
+    )
+    global_step = initial_global_step
+
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+    epoch_bar = tqdm(
+        range(NUM_EPOCHS),
+        desc="Epochs",
+        unit="epoch",
+    )
+    for epoch_index in epoch_bar:
+        epoch_number = epoch_index + 1
         model.train()
-        for batch in train_loader:
+        running_loss = 0.0
+        step_count = 0
+        try:
+            total_train_batches: Optional[int] = len(train_loader)
+        except TypeError:
+            total_train_batches = None
+        train_bar = tqdm(
+            train_loader,
+            desc=f"Train {epoch_number}/{NUM_EPOCHS}",
+            unit="batch",
+            leave=False,
+            total=total_train_batches,
+        )
+        for batch in train_bar:
             batch = {k: v.to(device) for k, v in batch.items()}
             outputs = model(**batch, return_loss=True)
-            loss_value = outputs.loss.item()
-            mlflow.log_metric("train_loss", loss_value, step=global_step + 1)
             loss = outputs.loss / GRADIENT_ACCUMULATION_STEPS
             loss.backward()
-            if (global_step + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+            if (step_count + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                 optimizer.step()
                 optimizer.zero_grad()
+            batch_loss = outputs.loss.item()
+            running_loss += batch_loss
+            step_count += 1
             global_step += 1
-            if global_step % VALIDATION_EVERY_STEPS == 0:
-                metrics = evaluate(model, val_loader, device)
-                print(f"step={global_step} loss={metrics.loss:.4f} acc={metrics.accuracy:.4f}")
-                mlflow.log_metric("val_loss", metrics.loss, step=global_step)
-                mlflow.log_metric("val_accuracy", metrics.accuracy, step=global_step)
-            if global_step >= MAX_STEPS:
-                return
 
+            avg_loss = running_loss / max(1, step_count)
+            train_bar.set_postfix(
+                loss=f"{batch_loss:.4f}",
+                avg_loss=f"{avg_loss:.4f}",
+            )
 
-# -----------------------------------------------------------------------------
-# Workflow
-# -----------------------------------------------------------------------------
+            if TRAIN_LOG_EVERY_STEPS and global_step % TRAIN_LOG_EVERY_STEPS == 0:
+                train_accuracy = compute_accuracy(outputs.logits_per_text.detach())
+                mlflow.log_metric("train_loss_step", batch_loss, step=global_step)
+                mlflow.log_metric("train_accuracy_step", train_accuracy, step=global_step)
 
+        if step_count % GRADIENT_ACCUMULATION_STEPS != 0:
+            optimizer.step()
+            optimizer.zero_grad()
+
+        avg_train_loss = running_loss / max(1, step_count)
+        mlflow.log_metric("train_loss", avg_train_loss, step=epoch_number)
+        metrics = evaluate(
+            model,
+            val_loader,
+            device,
+            desc=f"Val {epoch_number}/{NUM_EPOCHS}",
+        )
+        train_bar.close()
+        tqdm.write(
+            f"epoch={epoch_number}/{NUM_EPOCHS} train_loss={avg_train_loss:.4f} "
+            f"val_loss={metrics.loss:.4f} val_acc={metrics.accuracy:.4f}"
+        )
+        epoch_bar.set_postfix(
+            train_loss=f"{avg_train_loss:.4f}",
+            val_acc=f"{metrics.accuracy:.4f}",
+        )
+        mlflow.log_metric("val_loss", metrics.loss, step=epoch_number)
+        mlflow.log_metric("val_accuracy", metrics.accuracy, step=epoch_number)
+
+        if metrics.accuracy > best_val_accuracy:
+            best_val_accuracy = metrics.accuracy
+            save_checkpoint(model, processor, BEST_CHECKPOINT_DIR)
+
+    epoch_bar.close()
+    return best_val_accuracy
 
 def build_loaders(processor: AutoProcessor, sample_limit: Optional[int] = None) -> Dict[str, DataLoader]:
     samples = prepare_musiccaps_samples(sample_limit)
+    if not samples:
+        raise RuntimeError(
+            "No cached audio found. Ensure data/musiccaps/audio contains clips "
+            "matching the MusicCaps metadata."
+        )
     pivot = max(1, int(len(samples) * 0.9))
+    pivot = min(pivot, len(samples))
     train_dataset = MusicCapsDataset(samples[:pivot])
     val_dataset = MusicCapsDataset(samples[pivot:])
     collate = lambda batch: collate_fn(batch, processor)
@@ -331,12 +492,20 @@ def build_loaders(processor: AutoProcessor, sample_limit: Optional[int] = None) 
 if __name__ == "__main__":
     set_seed(RANDOM_SEED)
     device = get_device()
-    processor = AutoProcessor.from_pretrained(MODEL_NAME)
-    model = ClapModel.from_pretrained(MODEL_NAME).to(device)
+    checkpoint_source: str | Path = MODEL_NAME
+    loaded_from_checkpoint = False
+    if RESUME_TRAINING and BEST_CHECKPOINT_DIR.exists():
+        checkpoint_source = BEST_CHECKPOINT_DIR
+        loaded_from_checkpoint = True
+        print(f"Loading weights from checkpoint: {BEST_CHECKPOINT_DIR}")
+
+    processor = AutoProcessor.from_pretrained(checkpoint_source)
+    model = ClapModel.from_pretrained(checkpoint_source).to(device)
 
     if MODE == "train":
         mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
         mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+        launch_mlflow_ui(MLFLOW_TRACKING_URI)
         run = mlflow.start_run(run_name=MLFLOW_RUN_NAME)
         tracking_uri = mlflow.get_tracking_uri()
         if tracking_uri.startswith("file:"):
@@ -351,18 +520,47 @@ if __name__ == "__main__":
                 "learning_rate": LEARNING_RATE,
                 "weight_decay": WEIGHT_DECAY,
                 "batch_size": TRAIN_BATCH_SIZE,
-                "max_steps": MAX_STEPS,
                 "clip_seconds": CLIP_SECONDS,
                 "sampling_rate": AUDIO_SAMPLING_RATE,
+                "num_epochs": NUM_EPOCHS,
             }
         )
         try:
             loaders = build_loaders(processor)
-            train(model, processor, loaders["train"], loaders["val"], device)
-            metrics = evaluate(model, loaders["val"], device)
+            initial_best_accuracy: Optional[float] = None
+            if loaded_from_checkpoint:
+                baseline_metrics = evaluate(
+                    model,
+                    loaders["val"],
+                    device,
+                    desc="Validation (resume)",
+                )
+                print(
+                    "Resumed checkpoint validation: "
+                    f"loss={baseline_metrics.loss:.4f} acc={baseline_metrics.accuracy:.4f}"
+                )
+                mlflow.log_metric("resume_val_loss", baseline_metrics.loss, step=0)
+                mlflow.log_metric("resume_val_accuracy", baseline_metrics.accuracy, step=0)
+                initial_best_accuracy = baseline_metrics.accuracy
+
+            best_val_accuracy = train(
+                model,
+                processor,
+                loaders["train"],
+                loaders["val"],
+                device,
+                initial_best_val_accuracy=initial_best_accuracy,
+            )
+            metrics = evaluate(
+                model,
+                loaders["val"],
+                device,
+                desc="Validation (final)",
+            )
             print(f"final loss={metrics.loss:.4f} acc={metrics.accuracy:.4f}")
-            mlflow.log_metric("final_val_loss", metrics.loss)
-            mlflow.log_metric("final_val_accuracy", metrics.accuracy)
+            mlflow.log_metric("final_val_loss", metrics.loss, step=NUM_EPOCHS)
+            mlflow.log_metric("final_val_accuracy", metrics.accuracy, step=NUM_EPOCHS)
+            mlflow.log_metric("best_val_accuracy", best_val_accuracy, step=NUM_EPOCHS)
         finally:
             mlflow.end_run()
     elif MODE == "inference":
