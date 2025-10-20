@@ -557,31 +557,28 @@ def _load_audio_entry(audio_entry) -> tuple[np.ndarray, int]:
         cache_dir = audio_entry.get("_cache_dir")
         cache_key = audio_entry.get("_cache_key")
 
-        if "array" in audio_entry and audio_entry["array"] is not None:
+        # 1) Direct array
+        if audio_entry.get("array") is not None:
             arr = np.asarray(audio_entry["array"], dtype=np.float32)
             sr = int(audio_entry.get("sampling_rate") or audio_entry.get("samplingRate") or AUDIO_SAMPLING_RATE)
-            return arr, sr
-
-        p = audio_entry.get("path") or audio_entry.get("filepath")
-        if p:
-            source = _resolve_audio_path(str(p))
-            arr, sr = _librosa_decode(source)
             if arr.ndim > 1:
                 arr = arr.mean(axis=-1)
-            return arr.astype(np.float32), sr
+            return arr, sr
 
+        # 2) Bytes payload (prefer bytes over path: paths may be remote/unavailable)
         byte_data = audio_entry.get("bytes")
-        if byte_data:
+        if byte_data is not None:
             if isinstance(byte_data, memoryview):
                 byte_data = byte_data.tobytes()
             elif isinstance(byte_data, np.ndarray):
                 byte_data = byte_data.tobytes()
+            elif isinstance(byte_data, str):
+                byte_data = byte_data.encode("latin-1")
             elif not isinstance(byte_data, (bytes, bytearray)):
                 byte_data = bytes(byte_data)
 
-            suffix = ""
-            if isinstance(p, str):
-                suffix = Path(p).suffix
+            p_hint = audio_entry.get("path") or audio_entry.get("filepath")
+            suffix = Path(str(p_hint)).suffix if isinstance(p_hint, str) else ""
 
             if cache_dir and cache_key:
                 cache_dir_path = Path(cache_dir)
@@ -594,6 +591,16 @@ def _load_audio_entry(audio_entry) -> tuple[np.ndarray, int]:
                 source = cache_path
             else:
                 source = BytesIO(byte_data)
+
+            arr, sr = _librosa_decode(source)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=-1)
+            return arr.astype(np.float32), sr
+
+        # 3) Path on disk or URL
+        p = audio_entry.get("path") or audio_entry.get("filepath")
+        if p:
+            source = _resolve_audio_path(str(p))
             arr, sr = _librosa_decode(source)
             if arr.ndim > 1:
                 arr = arr.mean(axis=-1)
@@ -608,7 +615,18 @@ def _load_audio_entry(audio_entry) -> tuple[np.ndarray, int]:
             arr = arr.mean(axis=-1)
         return arr.astype(np.float32), sr
 
-    raise MissingAudioError("Unsupported audio entry format")
+    # Fallbacks for already-decoded waveforms
+    elif isinstance(audio_entry, np.ndarray):
+        arr = audio_entry.astype(np.float32)
+        return arr, AUDIO_SAMPLING_RATE
+    elif isinstance(audio_entry, torch.Tensor):
+        arr = audio_entry.detach().cpu().numpy().astype(np.float32)
+        return arr, AUDIO_SAMPLING_RATE
+    else:
+        arr = np.asarray(audio_entry, dtype=np.float32)
+        if arr.size == 0:
+            raise MissingAudioError("Audio array is empty")
+        return arr, AUDIO_SAMPLING_RATE
 
 
 def _infer_audio_duration(audio_entry) -> Optional[float]:
