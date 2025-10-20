@@ -1,57 +1,133 @@
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import os
 import random
 import shutil
 import subprocess
+import sys
+import json
 from dataclasses import dataclass
+from io import BytesIO, StringIO
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Iterable, List, Optional, Sequence
+from types import MethodType
+from typing import Dict, List, Optional
+import math
 
 import librosa
 import mlflow
 import numpy as np
+import requests
 import torch
-from datasets import load_dataset
-from torch import nn
+import torch.nn.functional as F
+from datasets import load_dataset, Audio
+from huggingface_hub import hf_hub_download
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 from transformers import AutoProcessor, ClapModel
-import yt_dlp
-from yt_dlp.utils import DownloadError
+from transformers.modeling_outputs import BaseModelOutputWithPooling
 from tqdm.auto import tqdm
 
-try:
-    import browser_cookie3
-except ImportError:
-    browser_cookie3 = None
 
-MODEL_NAME: str = "laion/clap-htsat-unfused"
-RANDOM_SEED: int = 42
-AUDIO_SAMPLING_RATE: int = 48_000
-CLIP_SECONDS: int = 10
-MODE: str = "train"  # or "inference"
-TRAIN_BATCH_SIZE: int = 22
-EVAL_BATCH_SIZE: int = 2
-LEARNING_RATE: float = 1e-5
-WEIGHT_DECAY: float = 1e-4
-NUM_EPOCHS: int = 10
-TRAIN_LOG_EVERY_STEPS: int = 10
-GRADIENT_ACCUMULATION_STEPS: int = 1
-AUDIO_CACHE_DIR: Path = Path("data/musiccaps/audio")
-MUSICCAPS_DATASET: str = "google/musiccaps"
-MUSICCAPS_SPLIT: str = "train"
-INFERENCE_PROMPT: str = "a melancholic indie ballad with soft vocals and slow tempo"
-INFERENCE_TOPK: int = 3
-MLFLOW_TRACKING_URI: str = "file:mlruns"
-MLFLOW_EXPERIMENT_NAME: str = "musiccaps_clap"
-MLFLOW_RUN_NAME: str = "clap_musiccaps_run"
-MLFLOW_AUTO_LAUNCH_UI: bool = True
-MLFLOW_UI_PORT: int = 5050
+# -----------------------------------------------------------------------------
+# Configuration
+# -----------------------------------------------------------------------------
 
-CHECKPOINT_DIR: Path = Path("checkpoints")
-BEST_CHECKPOINT_DIR: Path = CHECKPOINT_DIR / "best"
-RESUME_TRAINING: bool = True
+MODEL_NAME = "laion/clap-htsat-unfused"
+
+JAMENDO_DATASET_ID = "amaai-lab/JamendoMaxCaps"
+SONG_DESCRIBER_DATASET_ID = "renumics/song-describer-dataset"
+
+JAMENDO_TOTAL_SHARDS = 2272
+JAMENDO_SHARD_PAD = 5
+TRAIN_SHARDS_PER_CYCLE = 20
+EVAL_SHARDS_PER_CYCLE = 1
+
+RANDOM_SEED = 42
+AUDIO_SAMPLING_RATE = 48_000
+CLIP_SECONDS = 10
+
+TRAIN_BATCH_SIZE = 20
+EVAL_BATCH_SIZE = 1
+LEARNING_RATE = 1e-5
+WEIGHT_DECAY = 1e-4
+NUM_EPOCHS = 5
+GRADIENT_ACCUMULATION_STEPS = 1
+
+CONTEXT_GROWTH_FRACTION = 0.9
+TEXT_START_MAX_LEN = 77
+TEXT_TARGET_MAX_LEN_CAP = 512
+AUDIO_TARGET_MAX_SECONDS_CAP = 180
+SCHEDULE_SCAN_LIMIT = 1024
+
+MLFLOW_TRACKING_URI = "file:mlruns"
+MLFLOW_EXPERIMENT_NAME = "clap_jamendo"
+MLFLOW_RUN_NAME = "clap_jamendo_run"
+
+CHECKPOINT_DIR = Path("checkpoints")
+BEST_CHECKPOINT_DIR = CHECKPOINT_DIR / "best"
+LATEST_CHECKPOINT_DIR = CHECKPOINT_DIR / "latest"
+RESUME_TRAINING = True
+
+SHARD_CACHE_DIR = Path("data/jamendo_shards")
+AUDIO_CACHE_DIR = Path("data/audio_cache")
+HF_ENDPOINT_OVERRIDE = "https://hf-mirror.com"
+HF_REQUEST_TIMEOUT = "60"
+
+# -----------------------------------------------------------------------------
+# Caption index for Jamendo
+# -----------------------------------------------------------------------------
+_CAPTION_BY_ID: Optional[Dict[str, str]] = None
+
+
+# -----------------------------------------------------------------------------
+# Context schedule state
+# -----------------------------------------------------------------------------
+
+CURRENT_AUDIO_SECONDS = CLIP_SECONDS
+CURRENT_TEXT_MAX_LEN = TEXT_START_MAX_LEN
+_SCHEDULE_COLLATE_STEP = 0
+_SCHEDULE_ACTIVE = True
+SCHEDULE: Optional["ContextSchedule"] = None
+
+
+@dataclass
+class ContextSchedule:
+    audio_start_s: int
+    audio_target_s: int
+    text_start_tok: int
+    text_target_tok: int
+    growth_steps: int
+
+    def value_at(self, step: int) -> tuple[int, int]:
+        if self.growth_steps <= 0:
+            frac = 1.0
+        else:
+            frac = min(1.0, step / float(self.growth_steps))
+        audio_seconds = int(
+            round(self.audio_start_s + frac * (self.audio_target_s - self.audio_start_s))
+        )
+        text_tokens = int(
+            round(self.text_start_tok + frac * (self.text_target_tok - self.text_start_tok))
+        )
+        return max(1, audio_seconds), max(8, text_tokens)
+
+
+@dataclass
+class Metrics:
+    loss: float
+    accuracy: float
+
+
+class MissingAudioError(Exception):
+    """Raised when an audio asset cannot be resolved."""
+
+
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -68,180 +144,794 @@ def get_device() -> torch.device:
     return torch.device("cpu")
 
 
-def launch_mlflow_ui(tracking_uri: str) -> Optional[subprocess.Popen]:
-    if not MLFLOW_AUTO_LAUNCH_UI:
-        return None
-    if not tracking_uri.startswith("file:"):
-        print("MLflow UI launch skipped: tracking URI is not a local file store.")
-        return None
-    backend_root = Path(tracking_uri[5:]).resolve()
-    backend_root.mkdir(parents=True, exist_ok=True)
+def disable_fe_cap(processor: AutoProcessor) -> AutoProcessor:
+    feature_extractor = getattr(processor, "feature_extractor", None)
+    if feature_extractor is not None and hasattr(feature_extractor, "nb_max_samples"):
+        if getattr(feature_extractor, "nb_max_samples") is not None:
+            feature_extractor.nb_max_samples = None
+    return processor
+
+
+@torch.no_grad()
+def _interp_1d_pos(pos: torch.Tensor, new_n: int) -> torch.Tensor:
+    squeeze = False
+    if pos.dim() == 2:
+        pos = pos.unsqueeze(0)
+        squeeze = True
+    if pos.dim() != 3:
+        raise ValueError(f"Expected position tensor with 2 or 3 dims, got shape {tuple(pos.shape)}")
+    _, old_n, _ = pos.shape
+    if new_n == old_n:
+        return pos.squeeze(0) if squeeze else pos
+    resized = F.interpolate(pos.permute(0, 2, 1), size=new_n, mode="linear", align_corners=False).permute(0, 2, 1)
+    return resized.squeeze(0) if squeeze else resized
+
+
+
+# --- Minimal helper to enable dynamic audio context for audio tower ---
+def enable_audio_dynamic_context(model: ClapModel) -> ClapModel:
+    audio_model = getattr(model, "audio_model", None)
+    audio_encoder = getattr(audio_model, "audio_encoder", None)
+    if audio_encoder is not None:
+        _enable_dynamic_audio_context(audio_encoder)
+    return model
+
+
+def _audio_encoder_dynamic_reshape_mel2img(self, normalized_input_features: torch.Tensor) -> torch.Tensor:
+    batch, channels, time_length, freq_length = normalized_input_features.shape
+
+    target_freq = max(freq_length, self.spec_size // self.freq_ratio)
+    if freq_length != target_freq:
+        normalized_input_features = F.interpolate(
+            normalized_input_features, size=(time_length, target_freq), mode="bicubic", align_corners=True
+        )
+        freq_length = target_freq
+
+    if time_length % self.freq_ratio != 0:
+        pad = self.freq_ratio - (time_length % self.freq_ratio)
+        normalized_input_features = F.pad(normalized_input_features, (0, 0, 0, pad))
+        time_length += pad
+
+    reshaped = normalized_input_features.reshape(
+        batch, channels * self.freq_ratio, time_length // self.freq_ratio, freq_length
+    )
+    reshaped = reshaped.permute(0, 1, 3, 2).contiguous()
+    reshaped = reshaped.reshape(batch, channels, freq_length * self.freq_ratio, time_length // self.freq_ratio)
+    return reshaped
+
+
+def _audio_encoder_dynamic_forward(
+    self,
+    input_features,
+    is_longer: Optional[torch.FloatTensor] = None,
+    head_mask: Optional[torch.FloatTensor] = None,
+    output_attentions: Optional[bool] = False,
+    output_hidden_states: Optional[bool] = False,
+    output_hidden_states_before_downsampling: Optional[bool] = False,
+    always_partition: Optional[bool] = False,
+    return_dict: Optional[bool] = True,
+):
+    input_features = input_features.transpose(1, 3)
+    normalized_input_features = self.batch_norm(input_features)
+    normalized_input_features = normalized_input_features.transpose(1, 3)
+
+    is_longer_list_idx = None
+    if self.enable_fusion and is_longer is not None:
+        is_longer_list = is_longer.to(input_features.device)
+        is_longer_list_idx = torch.where(is_longer_list == 1)[0]
+
+    hidden_states_image = self.reshape_mel2img(normalized_input_features)
+
+    img_height = hidden_states_image.shape[2]
+    img_width = hidden_states_image.shape[3]
+
+
+    pad_height = (self.patch_stride[0] - img_height % self.patch_stride[0]) % self.patch_stride[0]
+    pad_width = (self.patch_stride[1] - img_width % self.patch_stride[1]) % self.patch_stride[1]
+    if pad_height or pad_width:
+        hidden_states_image = F.pad(hidden_states_image, (0, pad_width, 0, pad_height))
+        img_height += pad_height
+        img_width += pad_width
+
+    current_resolution = (
+        img_height // self.patch_stride[0],
+        img_width // self.patch_stride[1],
+    )
+    self._current_hw = current_resolution
+    # Keep ClapAudioPatchEmbed's bookkeeping in sync with dynamic H×W
+    try:
+        pe = self.patch_embed
+        if hasattr(pe, "img_size"):
+            pe.img_size = (img_height, img_width)
+        if hasattr(pe, "grid_size"):
+            pe.grid_size = current_resolution
+        if hasattr(pe, "num_patches"):
+            pe.num_patches = int(current_resolution[0] * current_resolution[1])
+    except Exception:
+        pass
+
+    hidden_states = self.patch_embed(hidden_states_image, is_longer_list_idx)
+
+    all_hidden_states = () if output_hidden_states else None
+    all_reshaped_hidden_states = () if output_hidden_states else None
+    all_self_attentions = () if output_attentions else None
+
+    if output_hidden_states:
+        batch_size, _, hidden_size = hidden_states.shape
+        reshaped_hidden_state = hidden_states.view(batch_size, current_resolution[0], current_resolution[1], hidden_size)
+        reshaped_hidden_state = reshaped_hidden_state.permute(0, 3, 1, 2)
+        all_hidden_states += (hidden_states,)
+        all_reshaped_hidden_states += (reshaped_hidden_state,)
+
+    for idx, layer_module in enumerate(self.layers):
+        layer_head_mask = head_mask[idx] if head_mask is not None else None
+        layer_outputs = layer_module(
+            hidden_states, current_resolution, layer_head_mask, output_attentions, always_partition
+        )
+
+        hidden_states = layer_outputs[0]
+        hidden_states_before_downsampling = layer_outputs[1]
+        output_dimensions = layer_outputs[2]
+
+        if output_hidden_states and output_hidden_states_before_downsampling:
+            batch_size, _, hidden_size = hidden_states_before_downsampling.shape
+            reshaped_hidden_state = hidden_states_before_downsampling.view(
+                batch_size, output_dimensions[0], output_dimensions[1], hidden_size
+            )
+            reshaped_hidden_state = reshaped_hidden_state.permute(0, 3, 1, 2)
+            all_hidden_states += (hidden_states_before_downsampling,)
+            all_reshaped_hidden_states += (reshaped_hidden_state,)
+        elif output_hidden_states and not output_hidden_states_before_downsampling:
+            batch_size, _, hidden_size = hidden_states.shape
+            reshaped_hidden_state = hidden_states.view(
+                batch_size, output_dimensions[-2], output_dimensions[-1], hidden_size
+            )
+            reshaped_hidden_state = reshaped_hidden_state.permute(0, 3, 1, 2)
+            all_hidden_states += (hidden_states,)
+            all_reshaped_hidden_states += (reshaped_hidden_state,)
+
+        if output_attentions:
+            all_self_attentions += layer_outputs[3:]
+
+        current_resolution = (output_dimensions[-2], output_dimensions[-1])
+
+    last_hidden_state = self.norm(hidden_states)
+
+    batch_size, _, n_channels = last_hidden_state.shape
+    height, width = current_resolution
+
+    last_hidden_state = last_hidden_state.permute(0, 2, 1).contiguous().reshape(batch_size, n_channels, height, width)
+
+    batch_size, n_channels, n_frequencies, n_temp = last_hidden_state.shape
+    c_freq_bin = max(1, n_frequencies // self.freq_ratio)
+    last_hidden_state = last_hidden_state.reshape(
+        batch_size, n_channels, n_frequencies // c_freq_bin, c_freq_bin, n_temp
+    )
+    last_hidden_state = (
+        last_hidden_state.permute(0, 1, 3, 2, 4).contiguous().reshape(batch_size, n_channels, c_freq_bin, -1)
+    )
+    latent_output = self.avgpool(torch.flatten(last_hidden_state, 2))
+    latent_output = torch.flatten(latent_output, 1)
+
+    if not return_dict:
+        return tuple(
+            v
+            for v in [
+                last_hidden_state,
+                latent_output,
+                all_reshaped_hidden_states,
+                all_self_attentions,
+            ]
+            if v is not None
+        )
+
+    return BaseModelOutputWithPooling(
+        last_hidden_state=last_hidden_state,
+        pooler_output=latent_output,
+        hidden_states=all_reshaped_hidden_states,
+        attentions=all_self_attentions,
+    )
+
+
+def _enable_dynamic_audio_context(audio_encoder) -> None:
+    if getattr(audio_encoder, "_dynamic_context_enabled", False):
+        return
+    audio_encoder._dynamic_context_enabled = True
+    audio_encoder._orig_reshape_mel2img = audio_encoder.reshape_mel2img
+    audio_encoder._orig_forward = audio_encoder.forward
+    audio_encoder.reshape_mel2img = MethodType(_audio_encoder_dynamic_reshape_mel2img, audio_encoder)
+    audio_encoder.forward = MethodType(_audio_encoder_dynamic_forward, audio_encoder)
+
+
+def enable_text_pos_interpolation(model: ClapModel) -> ClapModel:
+    text_embedding_module = None
+
+    for module in model.modules():
+        embedding = getattr(module, "position_embeddings", None)
+        if isinstance(embedding, torch.nn.Embedding):
+            text_embedding_module = embedding
+            break
+
+    if text_embedding_module is None:
+        return model
+
+    original_weight = text_embedding_module.weight.detach().clone().cpu()
+    padding_idx = text_embedding_module.padding_idx
+    requires_grad = text_embedding_module.weight.requires_grad
+
+    def hook(module: torch.nn.Embedding, inputs: tuple, kwargs: dict | None = None) -> None:
+        if not inputs:
+            return
+        position_ids = inputs[0]
+        if position_ids is None:
+            return
+        max_pos = int(position_ids.max().item()) + 1
+        if padding_idx is not None:
+            max_pos = max(max_pos, padding_idx + 1)
+        if max_pos <= module.weight.shape[0]:
+            return
+        base = original_weight
+        resized = _interp_1d_pos(base, max_pos)
+        new_weight = resized.to(module.weight.device, dtype=module.weight.dtype)
+        module.weight = torch.nn.Parameter(new_weight, requires_grad=requires_grad)
+        module.num_embeddings = max_pos
+
+    text_embedding_module.register_forward_pre_hook(hook, with_kwargs=False)
+    return model
+
+
+def launch_mlflow_ui(port: int = 5050) -> Optional[subprocess.Popen]:
+    tracking_uri = Path(mlflow.get_tracking_uri()[5:]).resolve()
+    tracking_uri.mkdir(parents=True, exist_ok=True)
     cmd = [
         "mlflow",
         "ui",
         "--backend-store-uri",
-        str(backend_root),
+        str(tracking_uri),
         "--host",
         "127.0.0.1",
         "--port",
-        str(MLFLOW_UI_PORT),
+        str(port),
     ]
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        print(f"MLflow UI available at http://127.0.0.1:{MLFLOW_UI_PORT}")
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"MLflow UI running at http://127.0.0.1:{port}")
         return proc
     except FileNotFoundError:
-        print("mlflow CLI not found in PATH; UI launch skipped.")
-    except OSError as exc:
-        print(f"Failed to launch MLflow UI: {exc}")
+        print("mlflow CLI not found; UI not launched.")
     return None
 
 
-@dataclass
-class MusicCapsSample:
-    ytid: str
-    start_s: float
-    text: str
-    audio_path: Path
+def _download_to_cache(url: str) -> str:
+    AUDIO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    target = AUDIO_CACHE_DIR / os.path.basename(url.split("?")[0])
+    if target.exists() and target.stat().st_size > 0:
+        return str(target)
+    last_exc: Optional[Exception] = None
+    for attempt in range(1, 4):
+        try:
+            with requests.get(url, timeout=60, stream=True) as r:
+                r.raise_for_status()
+                with open(target, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            f.write(chunk)
+            return str(target)
+        except Exception as exc:
+            last_exc = exc
+            if target.exists():
+                try:
+                    target.unlink()
+                except OSError:
+                    pass
+    raise MissingAudioError(f"Failed to download audio from {url}: {last_exc}")
 
 
-def load_musiccaps_metadata(sample_limit: Optional[int] = None) -> List[Dict[str, str]]:
-    dataset = load_dataset(MUSICCAPS_DATASET, split=MUSICCAPS_SPLIT)
-    if sample_limit is None or sample_limit >= len(dataset):
-        return list(dataset)
-    return [dataset[i] for i in range(sample_limit)]
+def _jamendo_shard_filename(index: int) -> str:
+    if index < 0 or index >= JAMENDO_TOTAL_SHARDS:
+        raise ValueError(f"Shard index {index} out of range (0-{JAMENDO_TOTAL_SHARDS-1})")
+    return f"train-{index:0{JAMENDO_SHARD_PAD}d}-of-{JAMENDO_TOTAL_SHARDS:0{JAMENDO_SHARD_PAD}d}.parquet"
 
 
-def prepare_musiccaps_samples(sample_limit: Optional[int] = None) -> List[MusicCapsSample]:
-    metadata = load_musiccaps_metadata(sample_limit)
-    ordered_rows: List[Dict[str, str]] = list(metadata)
-    order_index = {
-        (row["ytid"], float(row["start_s"])): idx for idx, row in enumerate(ordered_rows)
-    }
+def _download_shard(filename: str, base_dir: Path) -> str:
+    base_dir.mkdir(parents=True, exist_ok=True)
+    return hf_hub_download(
+        repo_id=JAMENDO_DATASET_ID,
+        filename=f"data/{filename}",
+        repo_type="dataset",
+        local_dir=str(base_dir),
+    )
 
-    all_samples: List[MusicCapsSample] = []
-    for row in ordered_rows:
-        clip_path = AUDIO_CACHE_DIR / f"{row['ytid']}_{int(row['start_s'])}.wav"
-        if clip_path.exists():
-            all_samples.append(
-                MusicCapsSample(
-                    ytid=row["ytid"],
-                    start_s=row["start_s"],
-                    text=row["caption"],
-                    audio_path=clip_path,
+
+# --- Jamendo captions index helpers ---
+def _download_captions_jsonl() -> str:
+    # Try both possible paths inside the HF dataset repo
+    caps_dir = SHARD_CACHE_DIR / "caps"
+    caps_dir.mkdir(parents=True, exist_ok=True)
+    print("Fetching Jamendo captions JSONL index...")
+    try:
+        return hf_hub_download(repo_id=JAMENDO_DATASET_ID, filename="final_caption30sec.jsonl", repo_type="dataset", local_dir=str(caps_dir))
+    except Exception:
+        return hf_hub_download(repo_id=JAMENDO_DATASET_ID, filename="data/final_caption30sec.jsonl", repo_type="dataset", local_dir=str(caps_dir))
+
+
+def _ensure_captions_index() -> None:
+    global _CAPTION_BY_ID
+    if _CAPTION_BY_ID is not None:
+        return
+    path = _download_captions_jsonl()
+    idx: Dict[str, str] = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                cid = str(obj.get("id") or "").strip()
+                cap = obj.get("caption")
+                if cid and isinstance(cap, str) and cid not in idx:
+                    idx[cid] = cap
+            except Exception:
+                continue
+    _CAPTION_BY_ID = idx
+
+
+def _load_jamendo_shard(index: int, cache_subdir: str) -> tuple[AudioTextDataset, str, Path]:
+    filename = _jamendo_shard_filename(index)
+    local_path = _download_shard(filename, SHARD_CACHE_DIR / cache_subdir)
+    ds_dict = load_dataset("parquet", data_files={"train": [local_path]}, streaming=False)
+    ds_dict = ds_dict.cast_column("audio", Audio(decode=False))
+    cache_dir = AUDIO_CACHE_DIR / cache_subdir / Path(filename).stem
+    dataset = AudioTextDataset(ds_dict["train"], cache_dir=cache_dir)
+    return dataset, local_path, cache_dir
+
+
+def _resolve_audio_path(path_str: str) -> str:
+    candidate = path_str.strip()
+    if os.path.exists(candidate):
+        return candidate
+    if candidate.startswith("http://") or candidate.startswith("https://"):
+        return _download_to_cache(candidate)
+    raise MissingAudioError(f"Audio path not accessible: {path_str}")
+
+
+@contextlib.contextmanager
+def _suppress_audio_backend_warnings() -> StringIO:
+    buffer = StringIO()
+    original_stderr = sys.stderr
+    fd = None
+    old_fd = None
+    devnull = None
+    try:
+        try:
+            fd = original_stderr.fileno()
+        except (OSError, ValueError, AttributeError):
+            fd = None
+        if fd is not None:
+            devnull = open(os.devnull, "w")
+            old_fd = os.dup(fd)
+            os.dup2(devnull.fileno(), fd)
+        with contextlib.redirect_stderr(buffer):
+            yield buffer
+    finally:
+        if fd is not None and old_fd is not None:
+            try:
+                os.dup2(old_fd, fd)
+            finally:
+                os.close(old_fd)
+        if devnull is not None:
+            devnull.close()
+
+
+def _librosa_decode(source) -> tuple[np.ndarray, int]:
+    if isinstance(source, (str, os.PathLike)):
+        target = str(source)
+        needs_reset = False
+    else:
+        target = source
+        needs_reset = hasattr(target, "seek")
+
+    if needs_reset:
+        try:
+            target.seek(0)
+        except Exception:
+            pass
+
+    with _suppress_audio_backend_warnings() as stderr_buffer:
+        try:
+            arr, sr = librosa.load(target, sr=None, mono=True)
+        except Exception as exc:
+            details = stderr_buffer.getvalue().strip()
+            note = f" ({details})" if details else ""
+            raise MissingAudioError(f"Failed to decode audio{note}") from exc
+    if arr.ndim > 1:
+        arr = arr.mean(axis=-1)
+    return arr.astype(np.float32), sr
+
+
+def _load_audio_entry(audio_entry) -> tuple[np.ndarray, int]:
+    if audio_entry is None:
+        raise MissingAudioError("Audio entry is None")
+    if isinstance(audio_entry, dict):
+        cache_dir = audio_entry.get("_cache_dir")
+        cache_key = audio_entry.get("_cache_key")
+
+        if "array" in audio_entry and audio_entry["array"] is not None:
+            arr = np.asarray(audio_entry["array"], dtype=np.float32)
+            sr = int(audio_entry.get("sampling_rate") or audio_entry.get("samplingRate") or AUDIO_SAMPLING_RATE)
+            return arr, sr
+
+        p = audio_entry.get("path") or audio_entry.get("filepath")
+        if p:
+            source = _resolve_audio_path(str(p))
+            arr, sr = _librosa_decode(source)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=-1)
+            return arr.astype(np.float32), sr
+
+        byte_data = audio_entry.get("bytes")
+        if byte_data:
+            if isinstance(byte_data, memoryview):
+                byte_data = byte_data.tobytes()
+            elif isinstance(byte_data, np.ndarray):
+                byte_data = byte_data.tobytes()
+            elif not isinstance(byte_data, (bytes, bytearray)):
+                byte_data = bytes(byte_data)
+
+            suffix = ""
+            if isinstance(p, str):
+                suffix = Path(p).suffix
+
+            if cache_dir and cache_key:
+                cache_dir_path = Path(cache_dir)
+                cache_dir_path.mkdir(parents=True, exist_ok=True)
+                suffix = suffix or ".mp3"
+                cache_path = cache_dir_path / f"{cache_key}{suffix}"
+                if not cache_path.exists() or cache_path.stat().st_size == 0:
+                    with open(cache_path, "wb") as f:
+                        f.write(byte_data)
+                source = cache_path
+            else:
+                source = BytesIO(byte_data)
+            arr, sr = _librosa_decode(source)
+            if arr.ndim > 1:
+                arr = arr.mean(axis=-1)
+            return arr.astype(np.float32), sr
+
+        raise MissingAudioError("Audio dict has no decodable data")
+
+    elif isinstance(audio_entry, str):
+        source = _resolve_audio_path(audio_entry)
+        arr, sr = _librosa_decode(source)
+        if arr.ndim > 1:
+            arr = arr.mean(axis=-1)
+        return arr.astype(np.float32), sr
+
+    raise MissingAudioError("Unsupported audio entry format")
+
+
+def _infer_audio_duration(audio_entry) -> Optional[float]:
+    try:
+        arr, sr = _load_audio_entry(audio_entry)
+        if arr.size == 0:
+            return None
+        return arr.shape[0] / float(sr)
+    except MissingAudioError:
+        return None
+
+
+def _extract_caption(row: Dict) -> str:
+    # 1) Try Jamendo captions indexed by track id (from final_caption30sec.jsonl)
+    try:
+        _ensure_captions_index()
+        audio = row.get("audio")
+        track_id = None
+        if isinstance(audio, dict):
+            p = audio.get("path") or audio.get("filepath")
+            if isinstance(p, str):
+                base = os.path.basename(p)
+                track_id = base.split(".")[0]
+        if not track_id:
+            rid = row.get("id")
+            if isinstance(rid, (str, int)):
+                track_id = str(rid)
+        if track_id and _CAPTION_BY_ID:
+            cap = _CAPTION_BY_ID.get(str(track_id))
+            if isinstance(cap, str) and cap.strip():
+                return cap
+    except Exception:
+        pass
+    # 2) Fallbacks present in some rows
+    for key in ("pseudo_caption", "description", "caption", "text"):
+        value = row.get(key)
+        if value:
+            return str(value)
+    # 3) Final fallback
+    return "instrumental music track"
+
+
+def _schedule_targets_from_samples(
+    durations: List[float],
+    texts: List[str],
+    tokenizer,
+) -> tuple[int, int]:
+    if durations:
+        audio_target = int(
+            min(
+                AUDIO_TARGET_MAX_SECONDS_CAP,
+                max(CLIP_SECONDS, round(float(np.percentile(durations, 95)))),
+            )
+        )
+    else:
+        audio_target = CLIP_SECONDS
+
+    text_target = TEXT_START_MAX_LEN
+    if tokenizer is not None and texts:
+        lengths: List[int] = []
+        for text in texts[:SCHEDULE_SCAN_LIMIT]:
+            try:
+                encoded = tokenizer(
+                    text,
+                    add_special_tokens=True,
+                    return_attention_mask=False,
+                    return_token_type_ids=False,
+                )
+                lengths.append(len(encoded["input_ids"]))
+            except Exception:
+                continue
+        if lengths:
+            text_target = int(
+                min(
+                    TEXT_TARGET_MAX_LEN_CAP,
+                    max(TEXT_START_MAX_LEN, max(lengths)),
                 )
             )
-    all_samples.sort(key=lambda sample: order_index[(sample.ytid, float(sample.start_s))])
-    return all_samples
+    return audio_target, text_target
+
+
+def _schedule_next_limits() -> None:
+    global _SCHEDULE_COLLATE_STEP, CURRENT_AUDIO_SECONDS, CURRENT_TEXT_MAX_LEN
+    if not _SCHEDULE_ACTIVE or SCHEDULE is None:
+        return
+    _SCHEDULE_COLLATE_STEP += 1
+    audio_seconds, text_tokens = SCHEDULE.value_at(_SCHEDULE_COLLATE_STEP)
+    CURRENT_AUDIO_SECONDS = min(audio_seconds, AUDIO_TARGET_MAX_SECONDS_CAP)
+    CURRENT_TEXT_MAX_LEN = min(text_tokens, TEXT_TARGET_MAX_LEN_CAP)
+
+
+def _enter_eval_limits() -> tuple[bool, int, int, int]:
+    global _SCHEDULE_ACTIVE, CURRENT_AUDIO_SECONDS, CURRENT_TEXT_MAX_LEN, _SCHEDULE_COLLATE_STEP
+    prev_state = (_SCHEDULE_ACTIVE, CURRENT_AUDIO_SECONDS, CURRENT_TEXT_MAX_LEN, _SCHEDULE_COLLATE_STEP)
+    _SCHEDULE_ACTIVE = False
+    if SCHEDULE is not None:
+        CURRENT_AUDIO_SECONDS = min(SCHEDULE.audio_target_s, AUDIO_TARGET_MAX_SECONDS_CAP)
+        CURRENT_TEXT_MAX_LEN = min(SCHEDULE.text_target_tok, TEXT_TARGET_MAX_LEN_CAP)
+    return prev_state
+
+
+def _exit_eval_limits(state: tuple[bool, int, int, int]) -> None:
+    global _SCHEDULE_ACTIVE, CURRENT_AUDIO_SECONDS, CURRENT_TEXT_MAX_LEN, _SCHEDULE_COLLATE_STEP
+    active, audio_seconds, text_tokens, collate_step = state
+    _SCHEDULE_ACTIVE = active
+    CURRENT_AUDIO_SECONDS = audio_seconds
+    CURRENT_TEXT_MAX_LEN = text_tokens
+    _SCHEDULE_COLLATE_STEP = collate_step
 
 
 # -----------------------------------------------------------------------------
-# Torch dataset
+# Dataset wrappers
 # -----------------------------------------------------------------------------
 
 
-class MusicCapsDataset(Dataset):
-    def __init__(self, samples: Sequence[MusicCapsSample]):
-        self.samples = list(samples)
+class AudioTextDataset(Dataset):
+    def __init__(self, hf_dataset, cache_dir: Optional[Path] = None):
+        self.ds = hf_dataset
+        self.cache_dir = cache_dir
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.ds)
 
-    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
-        sample = self.samples[index]
-        audio, _ = librosa.load(
-            sample.audio_path,
-            sr=AUDIO_SAMPLING_RATE,
-            mono=True,
-            offset=0.0,
-            duration=CLIP_SECONDS,
-        )
-        target_length = AUDIO_SAMPLING_RATE * CLIP_SECONDS
-        if audio.shape[0] < target_length:
-            pad_width = target_length - audio.shape[0]
-            audio = np.pad(audio, (0, pad_width))
-        if audio.shape[0] > target_length:
-            audio = audio[:target_length]
-        tensor = torch.from_numpy(audio.astype(np.float32))
-        return {"audio": tensor, "text": sample.text}
+    def __getitem__(self, index: int) -> Dict[str, object]:
+        row = self.ds[index]
+        audio_entry = self._find_audio_field(row)
+        if isinstance(audio_entry, dict):
+            audio_entry = dict(audio_entry)
+            if self.cache_dir is not None:
+                audio_entry.setdefault("_cache_dir", str(self.cache_dir))
+                audio_entry.setdefault("_cache_key", f"{index:06d}")
+        text = _extract_caption(row)
+        return {"audio": audio_entry, "text": text}
 
-def collate_fn(batch: Sequence[Dict[str, torch.Tensor]], processor: AutoProcessor) -> Dict[str, torch.Tensor]:
-    audios = [item["audio"].numpy() for item in batch]
-    texts = [item["text"] for item in batch]
-    inputs = processor(
+    @staticmethod
+    def _find_audio_field(row: Dict) -> Optional[object]:
+        audio = row.get("audio")
+        if isinstance(audio, dict) or isinstance(audio, str):
+            return audio
+        for key, value in row.items():
+            if isinstance(value, dict) and ("array" in value or "path" in value or "filepath" in value):
+                return value
+            if isinstance(value, str) and key.lower().endswith("audio"):
+                return value
+        return row.get("path") or row.get("filepath")
+
+
+def collate_batch(batch: List[Dict[str, object]], processor: AutoProcessor) -> Optional[Dict[str, torch.Tensor]]:
+    _schedule_next_limits()
+    target_len = int(AUDIO_SAMPLING_RATE * CURRENT_AUDIO_SECONDS)
+
+    audios: List[np.ndarray] = []
+    texts: List[str] = []
+
+    for item in batch:
+        audio_entry = item.get("audio")
+        try:
+            arr, sampling_rate = _load_audio_entry(audio_entry)
+        except MissingAudioError:
+            continue
+        if arr.ndim > 1:
+            arr = arr.mean(axis=-1)
+        if sampling_rate != AUDIO_SAMPLING_RATE and arr.size > 0:
+            arr = librosa.resample(arr, orig_sr=sampling_rate, target_sr=AUDIO_SAMPLING_RATE)
+        if target_len > 0 and arr.shape[0] > target_len:
+            max_start = arr.shape[0] - target_len
+            if _SCHEDULE_ACTIVE and max_start > 0:
+                start = np.random.randint(0, max_start + 1)
+            else:
+                start = max(0, max_start // 2)
+            arr = arr[start : start + target_len]
+        audios.append(arr.astype(np.float32))
+        texts.append(str(item.get("text", "")))
+
+    if not audios:
+        return None
+
+    feature_extractor_max_length = max(
+        target_len, max(audio.shape[0] for audio in audios) if audios else 0
+    )
+
+    text_inputs = processor(
         text=texts,
-        audios=audios,
-        sampling_rate=AUDIO_SAMPLING_RATE,
         return_tensors="pt",
         padding=True,
+        truncation=True,
+        max_length=CURRENT_TEXT_MAX_LEN,
     )
-    return inputs
+    audio_inputs = processor.feature_extractor(
+        raw_speech=audios,
+        sampling_rate=AUDIO_SAMPLING_RATE,
+        return_tensors="pt",
+        padding="longest",
+        truncation=False,
+        max_length=int(feature_extractor_max_length),
+    )
+
+    return {
+        "input_ids": text_inputs["input_ids"],
+        "attention_mask": text_inputs.get("attention_mask"),
+        "input_features": audio_inputs["input_features"],
+    }
+
+
+# -----------------------------------------------------------------------------
+# Data preparation
+# -----------------------------------------------------------------------------
+
+
+def _estimate_schedule_targets_from_shards(indices: List[int], processor: AutoProcessor) -> tuple[int, int, int]:
+    if not indices:
+        tokenizer = getattr(processor, "tokenizer", None)
+        audio_target, text_target = _schedule_targets_from_samples([], [], tokenizer)
+        return audio_target, text_target, 1
+
+    scan_dir = SHARD_CACHE_DIR / "scan"
+    local_path = _download_shard(_jamendo_shard_filename(indices[0]), scan_dir)
+    ds_dict = load_dataset("parquet", data_files={"train": [local_path]}, streaming=True)
+    
+    ds_dict = ds_dict.cast_column("audio", Audio(decode=False))
+
+    stream = ds_dict["train"]
+    durations: List[float] = []
+    texts: List[str] = []
+    sample_count = 0
+    for row in stream:
+        sample_count += 1
+        audio_entry = row.get("audio")
+        duration = _infer_audio_duration(audio_entry)
+        if duration:
+            durations.append(duration)
+        texts.append(_extract_caption(row))
+        if sample_count >= SCHEDULE_SCAN_LIMIT:
+            break
+    try:
+        os.remove(local_path)
+    except OSError:
+        pass
+
+    tokenizer = getattr(processor, "tokenizer", None)
+    audio_target, text_target = _schedule_targets_from_samples(durations, texts, tokenizer)
+    return audio_target, text_target, max(1, sample_count)
+
+
+def prepare_training(processor: AutoProcessor) -> Dict[str, object]:
+    global SCHEDULE, CURRENT_AUDIO_SECONDS, CURRENT_TEXT_MAX_LEN, _SCHEDULE_COLLATE_STEP, _SCHEDULE_ACTIVE
+
+    _ensure_captions_index()
+
+    audio_target, text_target, sample_count = _estimate_schedule_targets_from_shards([0], processor)
+    approx_batches_per_shard = max(1, sample_count // max(1, TRAIN_BATCH_SIZE))
+    planned_total = max(1, approx_batches_per_shard * max(1, TRAIN_SHARDS_PER_CYCLE) * NUM_EPOCHS)
+
+    SCHEDULE = ContextSchedule(
+        audio_start_s=CLIP_SECONDS,
+        audio_target_s=int(audio_target),
+        text_start_tok=TEXT_START_MAX_LEN,
+        text_target_tok=int(text_target),
+        growth_steps=planned_total * 2,
+    )
+    CURRENT_AUDIO_SECONDS = CLIP_SECONDS
+    CURRENT_TEXT_MAX_LEN = TEXT_START_MAX_LEN
+    _SCHEDULE_COLLATE_STEP = 0
+    _SCHEDULE_ACTIVE = True
+
+    song_eval_raw = load_dataset(SONG_DESCRIBER_DATASET_ID, split="train")
+    song_eval_dataset = AudioTextDataset(song_eval_raw)
+    song_eval_loader = DataLoader(
+        song_eval_dataset,
+        batch_size=EVAL_BATCH_SIZE,
+        shuffle=False,
+        collate_fn=lambda batch: collate_batch(batch, processor),
+    )
+
+    return {
+        "song_eval_loader": song_eval_loader,
+    }
+
+
+# -----------------------------------------------------------------------------
+# Training & evaluation
+# -----------------------------------------------------------------------------
 
 
 def compute_accuracy(logits: torch.Tensor) -> float:
     predictions = logits.argmax(dim=-1)
     targets = torch.arange(predictions.shape[0], device=predictions.device)
-    correct = (predictions == targets).float().mean().item()
-    return correct
-
-
-@dataclass
-class Metrics:
-    loss: float
-    accuracy: float
-
+    return (predictions == targets).float().mean().item()
 
 def evaluate(
     model: ClapModel,
-    loader: DataLoader,
+    loader: Optional[DataLoader],
     device: torch.device,
-    *,
-    desc: Optional[str] = None,
+    desc: str,
 ) -> Metrics:
+    if loader is None:
+        return Metrics(loss=0.0, accuracy=0.0)
+
     model.eval()
     total_loss = 0.0
     total_accuracy = 0.0
     steps = 0
-    progress_desc = desc or "Validation"
-    try:
-        total_batches: Optional[int] = len(loader)
-    except TypeError:
-        total_batches = None
-    progress_bar = tqdm(
-        loader,
-        desc=progress_desc,
-        unit="batch",
-        leave=False,
-        total=total_batches,
-    )
+    progress = tqdm(loader, desc=desc, leave=False)
     with torch.no_grad():
-        for batch in progress_bar:
-            batch = {k: v.to(device) for k, v in batch.items()}
+        for batch in progress:
+            if batch is None:
+                continue
+            batch = {k: v.to(device) for k, v in batch.items() if v is not None}
             outputs = model(**batch, return_loss=True)
             total_loss += outputs.loss.item()
             total_accuracy += compute_accuracy(outputs.logits_per_text)
             steps += 1
-            avg_loss = total_loss / steps
-            avg_accuracy = total_accuracy / steps
-            progress_bar.set_postfix(
-                loss=f"{avg_loss:.4f}",
-                acc=f"{avg_accuracy:.4f}",
+            progress.set_postfix(
+                loss=f"{total_loss / max(1, steps):.4f}",
+                acc=f"{total_accuracy / max(1, steps):.4f}",
             )
-    progress_bar.close()
+    progress.close()
     if steps == 0:
         return Metrics(loss=0.0, accuracy=0.0)
     return Metrics(loss=total_loss / steps, accuracy=total_accuracy / steps)
 
 
-def save_checkpoint(
-    model: ClapModel,
-    processor: AutoProcessor,
-    target_dir: Path,
-) -> None:
+def save_checkpoint(model: ClapModel, processor: AutoProcessor, target_dir: Path) -> None:
     if target_dir.exists():
         shutil.rmtree(target_dir)
     target_dir.mkdir(parents=True, exist_ok=True)
@@ -250,238 +940,220 @@ def save_checkpoint(
     print(f"Saved checkpoint: {target_dir}")
 
 
-def train(
+def _evaluate_jamendo_shards(
     model: ClapModel,
     processor: AutoProcessor,
-    train_loader: DataLoader,
-    val_loader: DataLoader,
+    indices: List[int],
     device: torch.device,
-    initial_best_val_accuracy: Optional[float] = None,
-    initial_global_step: int = 0,
-) -> float:
-    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
-    model.to(device)
-    best_val_accuracy = (
-        initial_best_val_accuracy if initial_best_val_accuracy is not None else -float("inf")
-    )
-    global_step = initial_global_step
-
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-
-    epoch_bar = tqdm(
-        range(NUM_EPOCHS),
-        desc="Epochs",
-        unit="epoch",
-    )
-    for epoch_index in epoch_bar:
-        epoch_number = epoch_index + 1
-        model.train()
-        running_loss = 0.0
-        step_count = 0
-        try:
-            total_train_batches: Optional[int] = len(train_loader)
-        except TypeError:
-            total_train_batches = None
-        train_bar = tqdm(
-            train_loader,
-            desc=f"Train {epoch_number}/{NUM_EPOCHS}",
-            unit="batch",
-            leave=False,
-            total=total_train_batches,
+) -> Metrics:
+    total_loss = 0.0
+    total_accuracy = 0.0
+    steps = 0
+    for idx in indices:
+        dataset, local_path, cache_dir = _load_jamendo_shard(idx, "eval")
+        loader = DataLoader(
+            dataset,
+            batch_size=EVAL_BATCH_SIZE,
+            shuffle=False,
+            collate_fn=lambda batch: collate_batch(batch, processor),
         )
-        for batch in train_bar:
-            batch = {k: v.to(device) for k, v in batch.items()}
+        for batch in loader:
+            if batch is None:
+                continue
+            batch = {k: v.to(device) for k, v in batch.items() if v is not None}
             outputs = model(**batch, return_loss=True)
-            loss = outputs.loss / GRADIENT_ACCUMULATION_STEPS
-            loss.backward()
-            if (step_count + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
-                optimizer.step()
-                optimizer.zero_grad()
-            batch_loss = outputs.loss.item()
-            running_loss += batch_loss
-            step_count += 1
-            global_step += 1
-
-            avg_loss = running_loss / max(1, step_count)
-            train_bar.set_postfix(
-                loss=f"{batch_loss:.4f}",
-                avg_loss=f"{avg_loss:.4f}",
-            )
-
-            if TRAIN_LOG_EVERY_STEPS and global_step % TRAIN_LOG_EVERY_STEPS == 0:
-                train_accuracy = compute_accuracy(outputs.logits_per_text.detach())
-                mlflow.log_metric("train_loss_step", batch_loss, step=global_step)
-                mlflow.log_metric("train_accuracy_step", train_accuracy, step=global_step)
-
-        if step_count % GRADIENT_ACCUMULATION_STEPS != 0:
-            optimizer.step()
-            optimizer.zero_grad()
-
-        avg_train_loss = running_loss / max(1, step_count)
-        mlflow.log_metric("train_loss", avg_train_loss, step=epoch_number)
-        metrics = evaluate(
-            model,
-            val_loader,
-            device,
-            desc=f"Val {epoch_number}/{NUM_EPOCHS}",
-        )
-        train_bar.close()
-        tqdm.write(
-            f"epoch={epoch_number}/{NUM_EPOCHS} train_loss={avg_train_loss:.4f} "
-            f"val_loss={metrics.loss:.4f} val_acc={metrics.accuracy:.4f}"
-        )
-        epoch_bar.set_postfix(
-            train_loss=f"{avg_train_loss:.4f}",
-            val_acc=f"{metrics.accuracy:.4f}",
-        )
-        mlflow.log_metric("val_loss", metrics.loss, step=epoch_number)
-        mlflow.log_metric("val_accuracy", metrics.accuracy, step=epoch_number)
-
-        if metrics.accuracy > best_val_accuracy:
-            best_val_accuracy = metrics.accuracy
-            save_checkpoint(model, processor, BEST_CHECKPOINT_DIR)
-
-    epoch_bar.close()
-    return best_val_accuracy
-
-def build_loaders(processor: AutoProcessor, sample_limit: Optional[int] = None) -> Dict[str, DataLoader]:
-    samples = prepare_musiccaps_samples(sample_limit)
-    if not samples:
-        raise RuntimeError(
-            "No cached audio found. Ensure data/musiccaps/audio contains clips "
-            "matching the MusicCaps metadata."
-        )
-    pivot = max(1, int(len(samples) * 0.9))
-    pivot = min(pivot, len(samples))
-    train_dataset = MusicCapsDataset(samples[:pivot])
-    val_dataset = MusicCapsDataset(samples[pivot:])
-    collate = lambda batch: collate_fn(batch, processor)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=TRAIN_BATCH_SIZE,
-        shuffle=True,
-        collate_fn=collate,
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=EVAL_BATCH_SIZE,
-        shuffle=False,
-        collate_fn=collate,
-    )
-    return {"train": train_loader, "val": val_loader, "samples": samples}
+            total_loss += outputs.loss.item()
+            total_accuracy += compute_accuracy(outputs.logits_per_text)
+            steps += 1
+        print(f"Evaluated shard {idx:05d}; removing {local_path}")
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
+        if cache_dir is not None:
+            shutil.rmtree(cache_dir, ignore_errors=True)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    if steps == 0:
+        return Metrics(loss=0.0, accuracy=0.0)
+    return Metrics(loss=total_loss / steps, accuracy=total_accuracy / steps)
 
 
-if __name__ == "__main__":
+def train_model(
+    model: ClapModel,
+    processor: AutoProcessor,
+    context: Dict[str, object],
+    device: torch.device,
+) -> Metrics:
+    optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    best_metrics = Metrics(loss=float("inf"), accuracy=0.0)
+    global_step = 0
+    processed_train_shards = 0
+
+    song_eval_loader: Optional[DataLoader] = context["song_eval_loader"]
+
+    for epoch in range(NUM_EPOCHS):
+        shard_index = 0
+        cycle = 0
+        while shard_index < JAMENDO_TOTAL_SHARDS:
+            train_indices = list(range(shard_index, min(shard_index + TRAIN_SHARDS_PER_CYCLE, JAMENDO_TOTAL_SHARDS)))
+            eval_start = min(JAMENDO_TOTAL_SHARDS, train_indices[-1] + 1) if train_indices else shard_index
+            eval_indices = list(range(eval_start, min(eval_start + EVAL_SHARDS_PER_CYCLE, JAMENDO_TOTAL_SHARDS))) if EVAL_SHARDS_PER_CYCLE else []
+
+            shard_bar = tqdm(total=len(train_indices), desc=f"Epoch {epoch + 1} | Cycle {cycle + 1} Training shards", leave=True)
+            for idx in train_indices:
+                model.train()
+                dataset, local_path, cache_dir = _load_jamendo_shard(idx, "train")
+                loader = DataLoader(
+                    dataset,
+                    batch_size=TRAIN_BATCH_SIZE,
+                    shuffle=True,
+                    collate_fn=lambda batch: collate_batch(batch, processor),
+                )
+                batch_progress = tqdm(loader, desc=f"Shard {idx:05d}", leave=True)
+                running_loss = 0.0
+                steps = 0
+                for batch in batch_progress:
+                    if batch is None:
+                        continue
+                    batch = {k: v.to(device) for k, v in batch.items() if v is not None}
+                    outputs = model(**batch, return_loss=True)
+                    loss = outputs.loss / GRADIENT_ACCUMULATION_STEPS
+                    loss.backward()
+                    if (steps + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
+                        optimizer.step()
+                        optimizer.zero_grad()
+                    running_loss += outputs.loss.item()
+                    steps += 1
+                    global_step += 1
+                    mlflow.log_metric("train_loss_step", outputs.loss.item(), step=global_step)
+                    mlflow.log_metric("allowed_audio_seconds", CURRENT_AUDIO_SECONDS, step=global_step)
+                    mlflow.log_metric("allowed_text_tokens", CURRENT_TEXT_MAX_LEN, step=global_step)
+                    batch_progress.set_postfix(loss=f"{running_loss / max(1, steps):.4f}")
+                batch_progress.close()
+                if steps > 0:
+                    shard_loss = running_loss / steps
+                    mlflow.log_metric("train_loss_shard", shard_loss, step=global_step)
+                print(f"Processed shard {idx:05d}; removing {local_path}")
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass
+                if cache_dir is not None:
+                    shutil.rmtree(cache_dir, ignore_errors=True)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                processed_train_shards += 1
+                if processed_train_shards % 5 == 0:
+                    save_checkpoint(model, processor, LATEST_CHECKPOINT_DIR)
+                shard_bar.update(1)
+            shard_bar.close()
+
+            if eval_indices:
+                prev_state = _enter_eval_limits()
+                jamendo_metrics = _evaluate_jamendo_shards(model, processor, eval_indices, device)
+                song_metrics = evaluate(model, song_eval_loader, device, desc="Song-Describer eval") if song_eval_loader is not None else Metrics(0.0, 0.0)
+                _exit_eval_limits(prev_state)
+                save_checkpoint(model, processor, LATEST_CHECKPOINT_DIR)
+
+                mlflow.log_metric("jamendo_val_loss", jamendo_metrics.loss, step=global_step)
+                mlflow.log_metric("jamendo_val_accuracy", jamendo_metrics.accuracy, step=global_step)
+                mlflow.log_metric("song_describer_val_loss", song_metrics.loss, step=global_step)
+                mlflow.log_metric("song_describer_val_accuracy", song_metrics.accuracy, step=global_step)
+
+                target_metrics = jamendo_metrics if eval_indices else song_metrics
+                if target_metrics.loss < best_metrics.loss:
+                    best_metrics = target_metrics
+                    save_checkpoint(model, processor, BEST_CHECKPOINT_DIR)
+
+            shard_index = eval_indices[-1] + 1 if eval_indices else train_indices[-1] + 1
+            cycle += 1
+
+    # Final evaluation on remaining eval shards (if any) and Song-Describer
+    prev_state = _enter_eval_limits()
+    jamendo_metrics = Metrics(0.0, 0.0)
+    song_metrics = evaluate(model, song_eval_loader, device, desc="Song-Describer eval (final)") if song_eval_loader is not None else Metrics(0.0, 0.0)
+    _exit_eval_limits(prev_state)
+
+    mlflow.log_metric("jamendo_val_loss_final", jamendo_metrics.loss, step=NUM_EPOCHS)
+    mlflow.log_metric("jamendo_val_accuracy_final", jamendo_metrics.accuracy, step=NUM_EPOCHS)
+    mlflow.log_metric("song_describer_val_loss_final", song_metrics.loss, step=NUM_EPOCHS)
+    mlflow.log_metric("song_describer_val_accuracy_final", song_metrics.accuracy, step=NUM_EPOCHS)
+
+    target_metrics = song_metrics
+    save_checkpoint(model, processor, LATEST_CHECKPOINT_DIR)
+    if target_metrics.loss < best_metrics.loss:
+        best_metrics = target_metrics
+        save_checkpoint(model, processor, BEST_CHECKPOINT_DIR)
+
+    return best_metrics
+
+
+# -----------------------------------------------------------------------------
+# Entry point
+# -----------------------------------------------------------------------------
+
+
+def main() -> None:
+    if HF_ENDPOINT_OVERRIDE and not os.environ.get("HF_ENDPOINT"):
+        os.environ["HF_ENDPOINT"] = HF_ENDPOINT_OVERRIDE
+        print(f"HF_ENDPOINT set to {HF_ENDPOINT_OVERRIDE}")
+    if HF_REQUEST_TIMEOUT and not os.environ.get("HF_HUB_REQUESTS_TIMEOUT"):
+        os.environ["HF_HUB_REQUESTS_TIMEOUT"] = HF_REQUEST_TIMEOUT
+
     set_seed(RANDOM_SEED)
     device = get_device()
+
     checkpoint_source: str | Path = MODEL_NAME
-    loaded_from_checkpoint = False
-    if RESUME_TRAINING and BEST_CHECKPOINT_DIR.exists():
-        checkpoint_source = BEST_CHECKPOINT_DIR
-        loaded_from_checkpoint = True
-        print(f"Loading weights from checkpoint: {BEST_CHECKPOINT_DIR}")
+    resumed_from: Optional[Path] = None
+    if RESUME_TRAINING:
+        if BEST_CHECKPOINT_DIR.exists():
+            checkpoint_source = BEST_CHECKPOINT_DIR
+            resumed_from = BEST_CHECKPOINT_DIR
+        elif LATEST_CHECKPOINT_DIR.exists():
+            checkpoint_source = LATEST_CHECKPOINT_DIR
+            resumed_from = LATEST_CHECKPOINT_DIR
+    if resumed_from is not None:
+        print(f"Resuming from checkpoint: {resumed_from}")
 
     processor = AutoProcessor.from_pretrained(checkpoint_source)
-    model = ClapModel.from_pretrained(checkpoint_source).to(device)
+    processor = disable_fe_cap(processor)
+    tokenizer = getattr(processor, "tokenizer", None)
+    if tokenizer is not None:
+        try:
+            tokenizer.model_max_length = max(int(TEXT_TARGET_MAX_LEN_CAP), int(getattr(tokenizer, "model_max_length", TEXT_START_MAX_LEN)))
+        except Exception:
+            tokenizer.model_max_length = TEXT_TARGET_MAX_LEN_CAP
 
-    if MODE == "train":
-        mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
-        mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
-        launch_mlflow_ui(MLFLOW_TRACKING_URI)
-        run = mlflow.start_run(run_name=MLFLOW_RUN_NAME)
-        tracking_uri = mlflow.get_tracking_uri()
-        if tracking_uri.startswith("file:"):
-            run_base = Path(tracking_uri[5:]).resolve()
-            run_url = f"file://{run_base}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
-        else:
-            run_url = f"{tracking_uri.rstrip('/')}/#/experiments/{run.info.experiment_id}/runs/{run.info.run_id}"
-        print(f"MLflow run started: {run_url}")
+    model = ClapModel.from_pretrained(checkpoint_source)
+    model = enable_audio_dynamic_context(model)
+    model = enable_text_pos_interpolation(model)
+    model = model.to(device)
+
+    _ensure_captions_index()
+
+    mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+    mlflow.set_experiment(MLFLOW_EXPERIMENT_NAME)
+    launch_mlflow_ui()
+
+    with mlflow.start_run(run_name=MLFLOW_RUN_NAME):
+        context = prepare_training(processor)
         mlflow.log_params(
             {
                 "model_name": MODEL_NAME,
                 "learning_rate": LEARNING_RATE,
                 "weight_decay": WEIGHT_DECAY,
-                "batch_size": TRAIN_BATCH_SIZE,
-                "clip_seconds": CLIP_SECONDS,
-                "sampling_rate": AUDIO_SAMPLING_RATE,
-                "num_epochs": NUM_EPOCHS,
+                "train_batch_size": TRAIN_BATCH_SIZE,
+                "eval_batch_size": EVAL_BATCH_SIZE,
+                "context_growth_fraction": CONTEXT_GROWTH_FRACTION,
+                "train_shards_per_cycle": TRAIN_SHARDS_PER_CYCLE,
+                "eval_shards_per_cycle": EVAL_SHARDS_PER_CYCLE,
             }
         )
-        try:
-            loaders = build_loaders(processor)
-            initial_best_accuracy: Optional[float] = None
-            if loaded_from_checkpoint:
-                baseline_metrics = evaluate(
-                    model,
-                    loaders["val"],
-                    device,
-                    desc="Validation (resume)",
-                )
-                print(
-                    "Resumed checkpoint validation: "
-                    f"loss={baseline_metrics.loss:.4f} acc={baseline_metrics.accuracy:.4f}"
-                )
-                mlflow.log_metric("resume_val_loss", baseline_metrics.loss, step=0)
-                mlflow.log_metric("resume_val_accuracy", baseline_metrics.accuracy, step=0)
-                initial_best_accuracy = baseline_metrics.accuracy
+        best_metrics = train_model(model, processor, context, device)
+        mlflow.log_metric("best_val_loss", best_metrics.loss, step=NUM_EPOCHS)
+        mlflow.log_metric("best_val_accuracy", best_metrics.accuracy, step=NUM_EPOCHS)
 
-            best_val_accuracy = train(
-                model,
-                processor,
-                loaders["train"],
-                loaders["val"],
-                device,
-                initial_best_val_accuracy=initial_best_accuracy,
-            )
-            metrics = evaluate(
-                model,
-                loaders["val"],
-                device,
-                desc="Validation (final)",
-            )
-            print(f"final loss={metrics.loss:.4f} acc={metrics.accuracy:.4f}")
-            mlflow.log_metric("final_val_loss", metrics.loss, step=NUM_EPOCHS)
-            mlflow.log_metric("final_val_accuracy", metrics.accuracy, step=NUM_EPOCHS)
-            mlflow.log_metric("best_val_accuracy", best_val_accuracy, step=NUM_EPOCHS)
-        finally:
-            mlflow.end_run()
-    elif MODE == "inference":
-        samples = prepare_musiccaps_samples(sample_limit=INFERENCE_TOPK)
-        audios: List[np.ndarray] = []
-        for sample in samples:
-            audio, _ = librosa.load(
-                sample.audio_path,
-                sr=AUDIO_SAMPLING_RATE,
-                mono=True,
-                offset=0.0,
-                duration=CLIP_SECONDS,
-            )
-            target_length = AUDIO_SAMPLING_RATE * CLIP_SECONDS
-            if audio.shape[0] < target_length:
-                audio = np.pad(audio, (0, target_length - audio.shape[0]))
-            if audio.shape[0] > target_length:
-                audio = audio[:target_length]
-            audios.append(audio.astype(np.float32))
-        batch = processor(
-            text=[INFERENCE_PROMPT],
-            audios=audios,
-            sampling_rate=AUDIO_SAMPLING_RATE,
-            return_tensors="pt",
-            padding=True,
-        )
-        batch = {k: v.to(device) for k, v in batch.items()}
-        outputs = model(**batch, return_loss=False)
-        probs = outputs.logits_per_text[0].softmax(dim=-1)
-        ranking = sorted(
-            zip(probs.tolist(), samples),
-            key=lambda item: item[0],
-            reverse=True,
-        )
-        print(f"Prompt: {INFERENCE_PROMPT}")
-        for idx, (score, sample) in enumerate(ranking, start=1):
-            snippet = sample.text.replace("\n", " ")
-            if len(snippet) > 80:
-                snippet = snippet[:77] + "..."
-            print(f"{idx}. score={score:.4f} | ytid={sample.ytid} | start={sample.start_s}s | caption={snippet}")
-    else:
-        raise ValueError("MODE must be either 'train' or 'inference'")
+
+if __name__ == "__main__":
+    main()
