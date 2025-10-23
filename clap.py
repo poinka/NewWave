@@ -40,25 +40,26 @@ JAMENDO_DATASET_ID = "amaai-lab/JamendoMaxCaps"
 SONG_DESCRIBER_DATASET_ID = "renumics/song-describer-dataset"
 
 JAMENDO_TOTAL_SHARDS = 2272
+JAMENDO_START_SHARD = 230
 JAMENDO_SHARD_PAD = 5
 TRAIN_SHARDS_PER_CYCLE = 20
 EVAL_SHARDS_PER_CYCLE = 1
 
 RANDOM_SEED = 42
 AUDIO_SAMPLING_RATE = 48_000
-CLIP_SECONDS = 10
+CLIP_SECONDS = 170
 
-TRAIN_BATCH_SIZE = 20
-EVAL_BATCH_SIZE = 1
+TRAIN_BATCH_SIZE = 2
+EVAL_BATCH_SIZE = 2
 LEARNING_RATE = 1e-5
 WEIGHT_DECAY = 1e-4
-NUM_EPOCHS = 5
-GRADIENT_ACCUMULATION_STEPS = 1
+NUM_EPOCHS = 1
+GRADIENT_ACCUMULATION_STEPS = 4
 
 CONTEXT_GROWTH_FRACTION = 0.9
-TEXT_START_MAX_LEN = 77
+TEXT_START_MAX_LEN = 170
 TEXT_TARGET_MAX_LEN_CAP = 512
-AUDIO_TARGET_MAX_SECONDS_CAP = 180
+AUDIO_TARGET_MAX_SECONDS_CAP = 240
 SCHEDULE_SCAN_LIMIT = 1024
 
 MLFLOW_TRACKING_URI = "file:mlruns"
@@ -74,6 +75,8 @@ SHARD_CACHE_DIR = Path("data/jamendo_shards")
 AUDIO_CACHE_DIR = Path("data/audio_cache")
 HF_ENDPOINT_OVERRIDE = "https://hf-mirror.com"
 HF_REQUEST_TIMEOUT = "60"
+
+HF_DATASETS_CACHE_DIR = SHARD_CACHE_DIR / "hf_datasets_cache"
 
 # -----------------------------------------------------------------------------
 # Caption index for Jamendo
@@ -477,14 +480,26 @@ def _ensure_captions_index() -> None:
     _CAPTION_BY_ID = idx
 
 
-def _load_jamendo_shard(index: int, cache_subdir: str) -> tuple[AudioTextDataset, str, Path]:
+def _hf_cache_dir(*parts: str) -> Path:
+    path = HF_DATASETS_CACHE_DIR.joinpath(*parts)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _load_jamendo_shard(index: int, cache_subdir: str) -> tuple[AudioTextDataset, str, Path, Path]:
     filename = _jamendo_shard_filename(index)
     local_path = _download_shard(filename, SHARD_CACHE_DIR / cache_subdir)
-    ds_dict = load_dataset("parquet", data_files={"train": [local_path]}, streaming=False)
+    hf_cache = _hf_cache_dir(cache_subdir, Path(filename).stem)
+    ds_dict = load_dataset(
+        "parquet",
+        data_files={"train": [local_path]},
+        streaming=False,
+        cache_dir=str(hf_cache),
+    )
     ds_dict = ds_dict.cast_column("audio", Audio(decode=False))
     cache_dir = AUDIO_CACHE_DIR / cache_subdir / Path(filename).stem
     dataset = AudioTextDataset(ds_dict["train"], cache_dir=cache_dir)
-    return dataset, local_path, cache_dir
+    return dataset, local_path, cache_dir, hf_cache
 
 
 def _resolve_audio_path(path_str: str) -> str:
@@ -844,8 +859,14 @@ def _estimate_schedule_targets_from_shards(indices: List[int], processor: AutoPr
 
     scan_dir = SHARD_CACHE_DIR / "scan"
     local_path = _download_shard(_jamendo_shard_filename(indices[0]), scan_dir)
-    ds_dict = load_dataset("parquet", data_files={"train": [local_path]}, streaming=True)
-    
+    hf_cache = _hf_cache_dir("scan", Path(local_path).stem)
+    ds_dict = load_dataset(
+        "parquet",
+        data_files={"train": [local_path]},
+        streaming=True,
+        cache_dir=str(hf_cache),
+    )
+
     ds_dict = ds_dict.cast_column("audio", Audio(decode=False))
 
     stream = ds_dict["train"]
@@ -865,6 +886,7 @@ def _estimate_schedule_targets_from_shards(indices: List[int], processor: AutoPr
         os.remove(local_path)
     except OSError:
         pass
+    shutil.rmtree(hf_cache, ignore_errors=True)
 
     tokenizer = getattr(processor, "tokenizer", None)
     audio_target, text_target = _schedule_targets_from_samples(durations, texts, tokenizer)
@@ -876,7 +898,8 @@ def prepare_training(processor: AutoProcessor) -> Dict[str, object]:
 
     _ensure_captions_index()
 
-    audio_target, text_target, sample_count = _estimate_schedule_targets_from_shards([0], processor)
+    start_shard = min(max(JAMENDO_START_SHARD, 0), max(0, JAMENDO_TOTAL_SHARDS - 1))
+    audio_target, text_target, sample_count = _estimate_schedule_targets_from_shards([start_shard], processor)
     approx_batches_per_shard = max(1, sample_count // max(1, TRAIN_BATCH_SIZE))
     planned_total = max(1, approx_batches_per_shard * max(1, TRAIN_SHARDS_PER_CYCLE) * NUM_EPOCHS)
 
@@ -892,7 +915,12 @@ def prepare_training(processor: AutoProcessor) -> Dict[str, object]:
     _SCHEDULE_COLLATE_STEP = 0
     _SCHEDULE_ACTIVE = True
 
-    song_eval_raw = load_dataset(SONG_DESCRIBER_DATASET_ID, split="train")
+    song_cache = _hf_cache_dir("song-describer")
+    song_eval_raw = load_dataset(
+        SONG_DESCRIBER_DATASET_ID,
+        split="train",
+        cache_dir=str(song_cache),
+    )
     song_eval_dataset = AudioTextDataset(song_eval_raw)
     song_eval_loader = DataLoader(
         song_eval_dataset,
@@ -968,7 +996,7 @@ def _evaluate_jamendo_shards(
     total_accuracy = 0.0
     steps = 0
     for idx in indices:
-        dataset, local_path, cache_dir = _load_jamendo_shard(idx, "eval")
+        dataset, local_path, cache_dir, hf_cache = _load_jamendo_shard(idx, "eval")
         loader = DataLoader(
             dataset,
             batch_size=EVAL_BATCH_SIZE,
@@ -990,6 +1018,9 @@ def _evaluate_jamendo_shards(
             pass
         if cache_dir is not None:
             shutil.rmtree(cache_dir, ignore_errors=True)
+        shutil.rmtree(hf_cache, ignore_errors=True)
+        loader = None
+        del dataset
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
     if steps == 0:
@@ -1002,6 +1033,7 @@ def train_model(
     processor: AutoProcessor,
     context: Dict[str, object],
     device: torch.device,
+    start_shard: int = 0,
 ) -> Metrics:
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     best_metrics = Metrics(loss=float("inf"), accuracy=0.0)
@@ -1010,8 +1042,56 @@ def train_model(
 
     song_eval_loader: Optional[DataLoader] = context["song_eval_loader"]
 
+    safe_start_shard = min(max(start_shard, 0), JAMENDO_TOTAL_SHARDS)
+    if safe_start_shard > 0:
+        print(f"Starting training from shard index {safe_start_shard}")
+
+    cycle_len = TRAIN_SHARDS_PER_CYCLE + EVAL_SHARDS_PER_CYCLE
+    cycle_offset = safe_start_shard % cycle_len if cycle_len > 0 else 0
+
+    def run_eval_cycle(eval_indices: List[int]) -> Metrics:
+        nonlocal best_metrics, global_step
+        if not eval_indices:
+            return Metrics(0.0, 0.0)
+        prev_state = _enter_eval_limits()
+        jamendo_metrics = _evaluate_jamendo_shards(model, processor, eval_indices, device)
+        song_metrics = (
+            evaluate(model, song_eval_loader, device, desc="Song-Describer eval")
+            if song_eval_loader is not None
+            else Metrics(0.0, 0.0)
+        )
+        _exit_eval_limits(prev_state)
+
+        mlflow.log_metric("jamendo_val_loss", jamendo_metrics.loss, step=global_step)
+        mlflow.log_metric("jamendo_val_accuracy", jamendo_metrics.accuracy, step=global_step)
+        mlflow.log_metric("song_describer_val_loss", song_metrics.loss, step=global_step)
+        mlflow.log_metric("song_describer_val_accuracy", song_metrics.accuracy, step=global_step)
+
+        target_metrics = jamendo_metrics if eval_indices else song_metrics
+        if target_metrics.loss < best_metrics.loss:
+            best_metrics = target_metrics
+            save_checkpoint(model, processor, BEST_CHECKPOINT_DIR)
+        return jamendo_metrics
+
+    if (
+        EVAL_SHARDS_PER_CYCLE
+        and cycle_len > 0
+        and cycle_offset >= TRAIN_SHARDS_PER_CYCLE
+        and safe_start_shard < JAMENDO_TOTAL_SHARDS
+    ):
+        eval_indices = list(
+            range(
+                safe_start_shard,
+                min(safe_start_shard + EVAL_SHARDS_PER_CYCLE, JAMENDO_TOTAL_SHARDS),
+            )
+        )
+        print(f"Resuming inside evaluation phase; running eval on shards {eval_indices}")
+        run_eval_cycle(eval_indices)
+        safe_start_shard = min(JAMENDO_TOTAL_SHARDS, eval_indices[-1] + 1)
+        cycle_offset = 0
+
     for epoch in range(NUM_EPOCHS):
-        shard_index = 0
+        shard_index = safe_start_shard if epoch == 0 else 0
         cycle = 0
         while shard_index < JAMENDO_TOTAL_SHARDS:
             train_indices = list(range(shard_index, min(shard_index + TRAIN_SHARDS_PER_CYCLE, JAMENDO_TOTAL_SHARDS)))
@@ -1021,7 +1101,7 @@ def train_model(
             shard_bar = tqdm(total=len(train_indices), desc=f"Epoch {epoch + 1} | Cycle {cycle + 1} Training shards", leave=True)
             for idx in train_indices:
                 model.train()
-                dataset, local_path, cache_dir = _load_jamendo_shard(idx, "train")
+                dataset, local_path, cache_dir, hf_cache = _load_jamendo_shard(idx, "train")
                 loader = DataLoader(
                     dataset,
                     batch_size=TRAIN_BATCH_SIZE,
@@ -1059,6 +1139,9 @@ def train_model(
                     pass
                 if cache_dir is not None:
                     shutil.rmtree(cache_dir, ignore_errors=True)
+                shutil.rmtree(hf_cache, ignore_errors=True)
+                loader = None
+                del dataset
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 processed_train_shards += 1
@@ -1068,21 +1151,8 @@ def train_model(
             shard_bar.close()
 
             if eval_indices:
-                prev_state = _enter_eval_limits()
-                jamendo_metrics = _evaluate_jamendo_shards(model, processor, eval_indices, device)
-                song_metrics = evaluate(model, song_eval_loader, device, desc="Song-Describer eval") if song_eval_loader is not None else Metrics(0.0, 0.0)
-                _exit_eval_limits(prev_state)
+                run_eval_cycle(eval_indices)
                 save_checkpoint(model, processor, LATEST_CHECKPOINT_DIR)
-
-                mlflow.log_metric("jamendo_val_loss", jamendo_metrics.loss, step=global_step)
-                mlflow.log_metric("jamendo_val_accuracy", jamendo_metrics.accuracy, step=global_step)
-                mlflow.log_metric("song_describer_val_loss", song_metrics.loss, step=global_step)
-                mlflow.log_metric("song_describer_val_accuracy", song_metrics.accuracy, step=global_step)
-
-                target_metrics = jamendo_metrics if eval_indices else song_metrics
-                if target_metrics.loss < best_metrics.loss:
-                    best_metrics = target_metrics
-                    save_checkpoint(model, processor, BEST_CHECKPOINT_DIR)
 
             shard_index = eval_indices[-1] + 1 if eval_indices else train_indices[-1] + 1
             cycle += 1
@@ -1118,9 +1188,15 @@ def main() -> None:
         print(f"HF_ENDPOINT set to {HF_ENDPOINT_OVERRIDE}")
     if HF_REQUEST_TIMEOUT and not os.environ.get("HF_HUB_REQUESTS_TIMEOUT"):
         os.environ["HF_HUB_REQUESTS_TIMEOUT"] = HF_REQUEST_TIMEOUT
+    if not os.environ.get("HF_HUB_DISABLE_HF_TRANSFER"):
+        os.environ["HF_HUB_DISABLE_HF_TRANSFER"] = "1"
+    if not os.environ.get("HF_HUB_ENABLE_HF_TRANSFER"):
+        os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
 
     set_seed(RANDOM_SEED)
     device = get_device()
+
+    HF_DATASETS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     checkpoint_source: str | Path = MODEL_NAME
     resumed_from: Optional[Path] = None
@@ -1168,10 +1244,9 @@ def main() -> None:
                 "eval_shards_per_cycle": EVAL_SHARDS_PER_CYCLE,
             }
         )
-        best_metrics = train_model(model, processor, context, device)
+        best_metrics = train_model(model, processor, context, device, start_shard=JAMENDO_START_SHARD)
         mlflow.log_metric("best_val_loss", best_metrics.loss, step=NUM_EPOCHS)
         mlflow.log_metric("best_val_accuracy", best_metrics.accuracy, step=NUM_EPOCHS)
-
 
 if __name__ == "__main__":
     main()
