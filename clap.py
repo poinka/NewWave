@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import contextlib
-import hashlib
 import os
 import random
 import shutil
@@ -13,8 +12,6 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from types import MethodType
 from typing import Dict, List, Optional
-import math
-
 import librosa
 import mlflow
 import numpy as np
@@ -40,26 +37,26 @@ JAMENDO_DATASET_ID = "amaai-lab/JamendoMaxCaps"
 SONG_DESCRIBER_DATASET_ID = "renumics/song-describer-dataset"
 
 JAMENDO_TOTAL_SHARDS = 2272
-JAMENDO_START_SHARD = 230
+JAMENDO_START_SHARD = 500
 JAMENDO_SHARD_PAD = 5
 TRAIN_SHARDS_PER_CYCLE = 20
 EVAL_SHARDS_PER_CYCLE = 1
 
 RANDOM_SEED = 42
 AUDIO_SAMPLING_RATE = 48_000
-CLIP_SECONDS = 170
+CLIP_SECONDS = 240
 
-TRAIN_BATCH_SIZE = 2
-EVAL_BATCH_SIZE = 2
-LEARNING_RATE = 1e-5
+TRAIN_BATCH_SIZE = 6
+EVAL_BATCH_SIZE = 6
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 NUM_EPOCHS = 1
-GRADIENT_ACCUMULATION_STEPS = 4
+GRADIENT_ACCUMULATION_STEPS = 2
 
 CONTEXT_GROWTH_FRACTION = 0.9
-TEXT_START_MAX_LEN = 170
+TEXT_START_MAX_LEN = 512
 TEXT_TARGET_MAX_LEN_CAP = 512
-AUDIO_TARGET_MAX_SECONDS_CAP = 240
+AUDIO_TARGET_MAX_SECONDS_CAP = 300
 SCHEDULE_SCAN_LIMIT = 1024
 
 MLFLOW_TRACKING_URI = "file:mlruns"
@@ -1051,10 +1048,11 @@ def train_model(
 
     def run_eval_cycle(eval_indices: List[int]) -> Metrics:
         nonlocal best_metrics, global_step
-        if not eval_indices:
+        fixed_eval_indices = [JAMENDO_TOTAL_SHARDS - 1] if JAMENDO_TOTAL_SHARDS > 0 else []
+        if not fixed_eval_indices:
             return Metrics(0.0, 0.0)
         prev_state = _enter_eval_limits()
-        jamendo_metrics = _evaluate_jamendo_shards(model, processor, eval_indices, device)
+        jamendo_metrics = _evaluate_jamendo_shards(model, processor, fixed_eval_indices, device)
         song_metrics = (
             evaluate(model, song_eval_loader, device, desc="Song-Describer eval")
             if song_eval_loader is not None
@@ -1067,7 +1065,7 @@ def train_model(
         mlflow.log_metric("song_describer_val_loss", song_metrics.loss, step=global_step)
         mlflow.log_metric("song_describer_val_accuracy", song_metrics.accuracy, step=global_step)
 
-        target_metrics = jamendo_metrics if eval_indices else song_metrics
+        target_metrics = jamendo_metrics if fixed_eval_indices else song_metrics
         if target_metrics.loss < best_metrics.loss:
             best_metrics = target_metrics
             save_checkpoint(model, processor, BEST_CHECKPOINT_DIR)
@@ -1115,6 +1113,9 @@ def train_model(
                     if batch is None:
                         continue
                     batch = {k: v.to(device) for k, v in batch.items() if v is not None}
+                    with torch.no_grad():
+                        if hasattr(model, "logit_scale"):
+                            model.logit_scale.clamp_(0.0, 4.6052)
                     outputs = model(**batch, return_loss=True)
                     loss = outputs.loss / GRADIENT_ACCUMULATION_STEPS
                     loss.backward()
@@ -1201,12 +1202,12 @@ def main() -> None:
     checkpoint_source: str | Path = MODEL_NAME
     resumed_from: Optional[Path] = None
     if RESUME_TRAINING:
-        if BEST_CHECKPOINT_DIR.exists():
-            checkpoint_source = BEST_CHECKPOINT_DIR
-            resumed_from = BEST_CHECKPOINT_DIR
-        elif LATEST_CHECKPOINT_DIR.exists():
+        if LATEST_CHECKPOINT_DIR.exists():
             checkpoint_source = LATEST_CHECKPOINT_DIR
             resumed_from = LATEST_CHECKPOINT_DIR
+        elif BEST_CHECKPOINT_DIR.exists():
+            checkpoint_source = BEST_CHECKPOINT_DIR
+            resumed_from = BEST_CHECKPOINT_DIR
     if resumed_from is not None:
         print(f"Resuming from checkpoint: {resumed_from}")
 
