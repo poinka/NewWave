@@ -37,17 +37,17 @@ JAMENDO_DATASET_ID = "amaai-lab/JamendoMaxCaps"
 SONG_DESCRIBER_DATASET_ID = "renumics/song-describer-dataset"
 
 JAMENDO_TOTAL_SHARDS = 2272
-JAMENDO_START_SHARD = 500
+JAMENDO_START_SHARD = 11 * 46 - 1 # Start from validation shard
 JAMENDO_SHARD_PAD = 5
-TRAIN_SHARDS_PER_CYCLE = 20
+TRAIN_SHARDS_PER_CYCLE = 10
 EVAL_SHARDS_PER_CYCLE = 1
 
 RANDOM_SEED = 42
 AUDIO_SAMPLING_RATE = 48_000
 CLIP_SECONDS = 240
 
-TRAIN_BATCH_SIZE = 6
-EVAL_BATCH_SIZE = 6
+TRAIN_BATCH_SIZE = 8
+EVAL_BATCH_SIZE = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 NUM_EPOCHS = 1
@@ -960,7 +960,13 @@ def evaluate(
             if batch is None:
                 continue
             batch = {k: v.to(device) for k, v in batch.items() if v is not None}
-            outputs = model(**batch, return_loss=True)
+            try:
+                outputs = model(**batch, return_loss=True)
+            except torch.cuda.OutOfMemoryError:
+                print(f"OOM during evaluation '{desc}'; skipping batch")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             total_loss += outputs.loss.item()
             total_accuracy += compute_accuracy(outputs.logits_per_text)
             steps += 1
@@ -1004,7 +1010,13 @@ def _evaluate_jamendo_shards(
             if batch is None:
                 continue
             batch = {k: v.to(device) for k, v in batch.items() if v is not None}
-            outputs = model(**batch, return_loss=True)
+            try:
+                outputs = model(**batch, return_loss=True)
+            except torch.cuda.OutOfMemoryError:
+                print(f"OOM during Jamendo eval shard {idx:05d}; skipping batch")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                continue
             total_loss += outputs.loss.item()
             total_accuracy += compute_accuracy(outputs.logits_per_text)
             steps += 1
@@ -1116,9 +1128,23 @@ def train_model(
                     with torch.no_grad():
                         if hasattr(model, "logit_scale"):
                             model.logit_scale.clamp_(0.0, 4.6052)
-                    outputs = model(**batch, return_loss=True)
+                    try:
+                        outputs = model(**batch, return_loss=True)
+                    except torch.cuda.OutOfMemoryError:
+                        print(f"OOM during training shard {idx:05d} forward; skipping batch")
+                        optimizer.zero_grad(set_to_none=True)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
                     loss = outputs.loss / GRADIENT_ACCUMULATION_STEPS
-                    loss.backward()
+                    try:
+                        loss.backward()
+                    except torch.cuda.OutOfMemoryError:
+                        print(f"OOM during training shard {idx:05d} backward; skipping batch")
+                        optimizer.zero_grad(set_to_none=True)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        continue
                     if (steps + 1) % GRADIENT_ACCUMULATION_STEPS == 0:
                         optimizer.step()
                         optimizer.zero_grad()
