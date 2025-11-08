@@ -14,3 +14,7 @@ accelerate==0.34.2
 huggingface_hub[hf_xet]
 torchcodec
 jupyter-server-proxy
+beautifulsoup4
+faiss-cpu
+fastapi
+uvicorn
