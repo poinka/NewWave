@@ -1,15 +1,11 @@
-"""FAISS-backed vector database for LyricCovers songs."""
-
-from __future__ import annotations
-
 import sqlite3
 from pathlib import Path
 from typing import Dict, List
 
-import faiss  # type: ignore
+import faiss
 import numpy as np
 
-from vector_encoders import encode_lyrics_biencoder, encode_text_clap
+from vector_encoders import encode_text_biencoder, encode_text_clap, encode_audio_clap
 
 
 class SongVectorDB:
@@ -29,8 +25,7 @@ class SongVectorDB:
         cur = self.conn.cursor()
         rows = cur.execute(
             """
-            SELECT song_id, title, artist, lyrics, audio_path, cover_path,
-                   lyrics_vector, audio_vector
+            SELECT song_id, title, artist, lyrics, audio_path, cover_path, lyrics_vector, audio_vector
             FROM songs
             """
         ).fetchall()
@@ -81,7 +76,7 @@ class SongVectorDB:
 
     def search_lyrics(self, query: str, top_k: int = 20) -> List[Dict]:
         top_k = max(1, min(top_k, len(self.records)))
-        query_vec = encode_lyrics_biencoder([query])[0].reshape(1, -1)
+        query_vec = encode_text_biencoder([query])[0].reshape(1, -1)
         faiss.normalize_L2(query_vec)
         scores, indices = self._lyric_index.search(query_vec.astype(np.float32), top_k)
         return self._format_results(indices[0], scores[0])
@@ -92,3 +87,35 @@ class SongVectorDB:
         faiss.normalize_L2(query_vec)
         scores, indices = self._audio_index.search(query_vec.astype(np.float32), top_k)
         return self._format_results(indices[0], scores[0])
+
+    def search_joint(self, query: str, top_k: int) -> List[Dict]:
+        """Найти песни, которые попали и в текстовый, и в аудио топ."""
+        lyrics_results = self.search_lyrics(query, top_k)
+        audio_results = self.search_audio(query, top_k)
+
+        audio_ids = {r["song_id"] for r in audio_results}
+        joint = [r for r in lyrics_results if r["song_id"] in audio_ids]
+        return joint
+
+    def recompute_vectors(self) -> None:
+        """Перекодировать все векторы в базе заново."""
+        cur = self.conn.cursor()
+
+        for record in self.records:
+            text_vec = encode_text_biencoder([record["lyrics"]])[0]
+            audio_vec = encode_audio_clap(Path(record["audio_path"]))
+
+            record["lyrics_vector"] = text_vec
+            record["audio_vector"] = audio_vec
+
+            cur.execute(
+                """
+                UPDATE songs
+                SET lyrics_vector = ?, audio_vector = ?
+                WHERE song_id = ?
+                """,
+                (text_vec.tobytes(), audio_vec.tobytes(), record["song_id"]),
+            )
+
+        self.conn.commit()
+        self._build_indexes()

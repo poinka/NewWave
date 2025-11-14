@@ -22,7 +22,7 @@ import pandas as pd
 import requests
 from bs4 import BeautifulSoup
 
-from vector_encoders import encode_audio_clap, encode_lyrics_biencoder
+from vector_encoders import encode_audio_clap, encode_text_biencoder
 
 REPO_URL = "https://github.com/Maxl94/LyricCovers2.0.git"
 DEFAULT_REPO_DIR = Path("LyricCovers2.0")
@@ -445,8 +445,8 @@ def process_samples_sequential(
             continue
 
         try:
-            lyric_vector = encode_lyrics_biencoder([record.lyrics])[0]
-            audio_vector = encode_audio_clap([record.audio_path])[0]
+            lyric_vector = encode_text_biencoder([record.lyrics])[0]
+            audio_vector = encode_audio_clap(record.audio_path)
             add_song_to_database(db_conn, record, lyric_vector, audio_vector)
             successes += 1
             logging.info(
