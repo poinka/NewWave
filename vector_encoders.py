@@ -7,8 +7,8 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModel, AutoProcessor, AutoTokenizer, ClapModel
 
-device = torch.device("cuda")  # поменяешь на то, что нужно
-clap_checkpoint_dir = Path("checkpoints/best")
+device = torch.device("mps")  # поменяешь на то, что нужно
+clap_checkpoint_dir = Path("checkpoints/clap")
 biencoder_checkpoint_dir = Path("checkpoints/biencoder")
 
 biencoder_tokenizer = None
