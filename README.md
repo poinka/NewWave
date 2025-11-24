@@ -109,6 +109,7 @@ We merge the strongest ideas: LLM‑based query parsing → joint audio+lyrics m
 
 ## How to run the API locally (quick start)
 
+0. Get your Mac IP via a `ipconfig getifaddr en0` command and paste it to `New-Wave-Info.plist` file
 1. `cd "/Users/vladislavkalinichenko/VSCodeProjects/new wave/NewWave"`
 2. `source .venv/bin/activate && uvicorn api:app --host 0.0.0.0 --port 8888`
 3. (new terminal) `curl http://127.0.0.1:8888/health`
@@ -120,5 +121,3 @@ For a phone on the same Wi‑Fi: `ipconfig getifaddr en0` → use `http://<that-
 1. In Xcode, open the **New Wave** target → **Info** tab → add a `String` key named `VectorAPIBaseURL`.
 2. Set its value to the Mac’s LAN URL, e.g. `http://10.91.49.14:8888`.
 3. Rebuild/install the app. The client reads this value at launch, so change it whenever the server IP changes.
-
-For physical devices on iOS 14+, also add `NSLocalNetworkUsageDescription` (String) and describe why the app talks to your Mac (“Needed to connect to the New Wave server on your laptop”). Approve the prompt the first time; otherwise local HTTP calls are blocked.

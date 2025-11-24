@@ -1,6 +1,9 @@
 import base64
 import json
+import logging
+import time
 from pathlib import Path
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
@@ -19,6 +22,11 @@ except FileNotFoundError:
     ) from None
 
 app = FastAPI(title="LyricCovers Vector API", version="1.0")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger("lyriccovers.api")
 
 
 class SearchRequest(BaseModel):
@@ -48,7 +56,15 @@ def search_audio(request: SearchRequest):
 
 
 def _song_stream(songs):
-    for song in songs:
+    total = len(songs)
+    for idx, song in enumerate(songs, start=1):
+        logger.info(
+            "Streaming song %s/%s: %s — %s",
+            idx,
+            total,
+            song["artist"],
+            song["title"],
+        )
         audio_bytes = Path(song["audio_path"]).read_bytes()
         cover_bytes = Path(song["cover_path"]).read_bytes()
         payload = {
@@ -63,7 +79,24 @@ def _song_stream(songs):
 @app.post("/search/combined")
 def search_combined(request: SearchRequest):
     try:
+        req_id = uuid4().hex[:8]
+        start = time.perf_counter()
+        logger.info(
+            "[%s] Received combined search: query='%s', top_k=%s",
+            req_id,
+            request.query,
+            request.top_k,
+        )
         songs = VECTOR_DB.search_joint(request.query, top_k=request.top_k)
-        return StreamingResponse(_song_stream(songs), media_type="application/x-ndjson")
+        logger.info(
+            "[%s] Search done in %.2fs, matched %s joint songs. Starting stream...",
+            req_id,
+            time.perf_counter() - start,
+            len(songs),
+        )
+        return StreamingResponse(
+            _song_stream(songs),
+            media_type="application/x-ndjson",
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
