@@ -95,7 +95,19 @@ class SongVectorDB:
 
         audio_ids = {r["song_id"] for r in audio_results}
         joint = [r for r in lyrics_results if r["song_id"] in audio_ids]
-        return joint
+
+        if len(joint) < top_k:
+            seen = {r["song_id"] for r in joint}
+            fallback_candidates = lyrics_results + audio_results
+            for candidate in fallback_candidates:
+                if candidate["song_id"] in seen:
+                    continue
+                joint.append(candidate)
+                seen.add(candidate["song_id"])
+                if len(joint) >= top_k:
+                    break
+
+        return joint[:top_k]
 
     def recompute_vectors(self) -> None:
         """Перекодировать все векторы в базе заново."""
