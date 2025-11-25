@@ -42,7 +42,7 @@ def health_check() -> dict:
 @app.post("/search/lyrics")
 def search_lyrics(request: SearchRequest):
     try:
-        return VECTOR_DB.search_lyrics(request.query, top_k=request.top_k)
+        return VECTOR_DB.search(request.query, top_k=request.top_k)
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -50,7 +50,33 @@ def search_lyrics(request: SearchRequest):
 @app.post("/search/audio")
 def search_audio(request: SearchRequest):
     try:
-        return VECTOR_DB.search_audio(request.query, top_k=request.top_k)
+        return VECTOR_DB.search(request.query, top_k=request.top_k)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.post("/search")
+def search(request: SearchRequest):
+    try:
+        req_id = uuid4().hex[:8]
+        start = time.perf_counter()
+        logger.info(
+            "[%s] Received fusion search: query='%s', top_k=%s",
+            req_id,
+            request.query,
+            request.top_k,
+        )
+        songs = VECTOR_DB.search(request.query, top_k=request.top_k)
+        logger.info(
+            "[%s] Search done in %.2fs, matched %s songs. Starting stream...",
+            req_id,
+            time.perf_counter() - start,
+            len(songs),
+        )
+        return StreamingResponse(
+            _song_stream(songs),
+            media_type="application/x-ndjson",
+        )
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -87,9 +113,9 @@ def search_combined(request: SearchRequest):
             request.query,
             request.top_k,
         )
-        songs = VECTOR_DB.search_joint(request.query, top_k=request.top_k)
+        songs = VECTOR_DB.search(request.query, top_k=request.top_k)
         logger.info(
-            "[%s] Search done in %.2fs, matched %s joint songs. Starting stream...",
+            "[%s] Search done in %.2fs, matched %s songs. Starting stream...",
             req_id,
             time.perf_counter() - start,
             len(songs),

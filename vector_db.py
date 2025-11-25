@@ -2,10 +2,15 @@ import sqlite3
 from pathlib import Path
 from typing import Dict, List
 
-import faiss
 import numpy as np
 
-from vector_encoders import encode_text_biencoder, encode_text_clap, encode_audio_clap
+from vector_encoders import (
+    encode_audio_clap,
+    encode_fusion_query,
+    encode_fusion_tracks,
+    encode_text_biencoder,
+    encode_text_clap,
+)
 
 
 class SongVectorDB:
@@ -34,7 +39,7 @@ class SongVectorDB:
         for row in rows:
             lyric_vec = np.frombuffer(row["lyrics_vector"], dtype=np.float32)
             audio_vec = np.frombuffer(row["audio_vector"], dtype=np.float32)
-            record = {
+            record: Dict[str, object] = {
                 "song_id": row["song_id"],
                 "title": row["title"],
                 "artist": row["artist"],
@@ -47,16 +52,11 @@ class SongVectorDB:
             self.records.append(record)
 
     def _build_indexes(self) -> None:
-        lyric_matrix = np.stack([r["lyrics_vector"] for r in self.records])
         audio_matrix = np.stack([r["audio_vector"] for r in self.records])
-        faiss.normalize_L2(lyric_matrix)
-        faiss.normalize_L2(audio_matrix)
-        lyric_dim = lyric_matrix.shape[1]
-        audio_dim = audio_matrix.shape[1]
-        self._lyric_index = faiss.IndexFlatIP(lyric_dim)
-        self._audio_index = faiss.IndexFlatIP(audio_dim)
-        self._lyric_index.add(lyric_matrix.astype(np.float32))
-        self._audio_index.add(audio_matrix.astype(np.float32))
+        lyric_matrix = np.stack([r["lyrics_vector"] for r in self.records])
+        fusion_matrix = encode_fusion_tracks(audio_matrix, lyric_matrix)
+        fusion_matrix /= np.linalg.norm(fusion_matrix, axis=1, keepdims=True) + 1e-8
+        self._fusion_matrix = fusion_matrix.astype(np.float32)
 
     def _format_results(self, indices: np.ndarray, scores: np.ndarray) -> List[Dict]:
         results: List[Dict] = []
@@ -74,40 +74,18 @@ class SongVectorDB:
             )
         return results
 
-    def search_lyrics(self, query: str, top_k: int = 20) -> List[Dict]:
+    def search(self, query: str, top_k: int = 20) -> List[Dict]:
         top_k = max(1, min(top_k, len(self.records)))
-        query_vec = encode_text_biencoder([query])[0].reshape(1, -1)
-        faiss.normalize_L2(query_vec)
-        scores, indices = self._lyric_index.search(query_vec.astype(np.float32), top_k)
-        return self._format_results(indices[0], scores[0])
-
-    def search_audio(self, text_query: str, top_k: int = 20) -> List[Dict]:
-        top_k = max(1, min(top_k, len(self.records)))
-        query_vec = encode_text_clap([text_query])[0].reshape(1, -1)
-        faiss.normalize_L2(query_vec)
-        scores, indices = self._audio_index.search(query_vec.astype(np.float32), top_k)
-        return self._format_results(indices[0], scores[0])
+        query_vec = encode_fusion_query([query])[0]
+        query_vec = query_vec / (np.linalg.norm(query_vec) + 1e-8)
+        scores = self._fusion_matrix @ query_vec.astype(np.float32)
+        top_idx = np.argpartition(-scores, range(top_k))[:top_k]
+        top_idx = top_idx[np.argsort(-scores[top_idx])]
+        return self._format_results(top_idx, scores[top_idx])
 
     def search_joint(self, query: str, top_k: int) -> List[Dict]:
-        """Найти песни, которые попали и в текстовый, и в аудио топ."""
-        lyrics_results = self.search_lyrics(query, top_k)
-        audio_results = self.search_audio(query, top_k)
-
-        audio_ids = {r["song_id"] for r in audio_results}
-        joint = [r for r in lyrics_results if r["song_id"] in audio_ids]
-
-        if len(joint) < top_k:
-            seen = {r["song_id"] for r in joint}
-            fallback_candidates = lyrics_results + audio_results
-            for candidate in fallback_candidates:
-                if candidate["song_id"] in seen:
-                    continue
-                joint.append(candidate)
-                seen.add(candidate["song_id"])
-                if len(joint) >= top_k:
-                    break
-
-        return joint[:top_k]
+        """Совместимый вызов старого API; теперь использует Fusion."""
+        return self.search(query, top_k)
 
     def recompute_vectors(self) -> None:
         """Перекодировать все векторы в базе заново."""
