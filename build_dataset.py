@@ -1,5 +1,5 @@
 """
-build_dataset.py - Объединяет FMA (audio) + Song-Interpretation (lyrics) + Song Describer (descriptions)
+build_dataset.py - Joins FMA (audio) + Song-Interpretation (lyrics) + Song Describer (descriptions)
 """
 
 import os
@@ -12,7 +12,7 @@ import shutil
 from collections import defaultdict
 import random
 
-# ========== НАСТРОЙКИ ==========
+# ========== Settings ==========
 PROJECT_DIR = os.path.expanduser('~/music_fusion_project')
 FMA_AUDIO_DIR = os.path.join(PROJECT_DIR, 'fma_large')
 FMA_METADATA_PATH = os.path.join(PROJECT_DIR, 'fma_metadata', 'tracks.csv')
@@ -22,7 +22,7 @@ AUDIO_OUTPUT = os.path.join(OUTPUT_DIR, 'audio')
 
 os.makedirs(AUDIO_OUTPUT, exist_ok=True)
 
-FUZZY_THRESHOLD = 80  # порог для матча по title
+FUZZY_THRESHOLD = 80  # threshold for title match
 
 print("="*70)
 print("BUILDING FUSION DATASET")
@@ -101,7 +101,7 @@ for track_id, row in tqdm(fma_tracks.iterrows(), total=len(fma_tracks), desc="  
 
 print(f"  ✓ FMA tracks with audio: {len(fma_data)}")
 
-# индексы по артисту
+# indices by artist
 fma_by_artist = defaultdict(list)
 for item in fma_data:
     fma_by_artist[item['artist']].append(item)
@@ -110,9 +110,9 @@ descr_by_artist = defaultdict(list)
 for item in descriptions_data:
     descr_by_artist[item['artist']].append(item)
 
-# ========== функции матчинга ==========
+# ========== Matching functions ==========
 def find_best_match_by_artist(query_artist, query_title, index_dict):
-    """Поиск только среди треков этого артиста."""
+    """Search only among tracks by this artist."""
     candidates = index_dict.get(query_artist, [])
     if not candidates:
         return None, 0
@@ -126,7 +126,7 @@ def find_best_match_by_artist(query_artist, query_title, index_dict):
     return best_match, best_score
 
 def find_best_match_global(query_artist, query_title, candidates):
-    """Fallback: ищем по всей выборке (artist+title одной строкой)."""
+    """Fallback: search across the entire dataset (artist+title as a single string)."""
     if not candidates:
         return None, 0
     query = f"{query_artist} - {query_title}"
@@ -144,14 +144,14 @@ for lyrics_item in tqdm(lyrics_data, desc="  Matching"):
     artist = lyrics_item['artist']
     title  = lyrics_item['title']
 
-    # 1) сначала ищем только среди такого же артиста
+    # 1) first, search only among tracks by the same artist
     fma_match, fma_score = find_best_match_by_artist(artist, title, fma_by_artist)
 
-    # 2) если артиста нет или score ниже порога — fallback по всем трекам
+    # 2) if artist not found or score below threshold — fallback to all tracks
     if (not fma_match) or (fma_score < FUZZY_THRESHOLD):
         fma_match, fma_score = find_best_match_global(artist, title, fma_data)
 
-    # descriptions: только по артисту (fallback глобальный можно добавить по аналогии)
+    # descriptions: only by artist (global fallback can be added similarly)
     if descriptions_data:
         desc_match, desc_score = find_best_match_by_artist(artist, title, descr_by_artist)
     else:
@@ -178,7 +178,7 @@ for lyrics_item in tqdm(lyrics_data, desc="  Matching"):
 
 print(f"  ✓ Matched {len(final_dataset)} tracks with all components")
 
-# ========== 5. Копирование аудио ==========
+# ========== 5. Copying audio ==========
 print("\n[5/6] Copying audio files...")
 for item in tqdm(final_dataset, desc="  Copying"):
     new_audio_path = os.path.join(AUDIO_OUTPUT, f"{item['track_id']}.mp3")
@@ -188,7 +188,7 @@ for item in tqdm(final_dataset, desc="  Copying"):
     except Exception as e:
         print(f"  Warning: Failed to copy {item['fma_id']}: {e}")
 
-# ========== 6. Сохранение и сплиты ==========
+# ========== 6. Saving and splits ==========
 print("\n[6/6] Saving dataset...")
 
 full_file = os.path.join(OUTPUT_DIR, 'full_dataset.json')
