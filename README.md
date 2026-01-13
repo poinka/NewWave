@@ -1,5 +1,4 @@
-# D1.1 Progress Submission
-
+# NEW WAVE - music recommendation system
 ## Team Information
 
 - Project name: New Wave
