@@ -37,12 +37,6 @@ class FusionEncoder(torch.nn.Module):
 
     def forward(self, audio_emb: torch.Tensor, text_emb: torch.Tensor) -> torch.Tensor:
         x = torch.cat([audio_emb, text_emb], dim=-1)
-        if x.shape[-1] != self.in_dim:
-            if x.shape[-1] < self.in_dim:
-                pad = self.in_dim - x.shape[-1]
-                x = torch.nn.functional.pad(x, (0, pad))
-            else:
-                x = x[..., : self.in_dim]
         x = self.mlp(x)
         x = self.norm(x)
         return F.normalize(x, p=2, dim=-1)
@@ -89,14 +83,29 @@ def load_fusion() -> FusionEncoder:
 
     state_dict = torch.load(fusion_checkpoint_path, map_location="cpu")
     first_w = state_dict.get("mlp.0.weight")
+    first_b = state_dict.get("mlp.0.bias")
     last_w = state_dict.get("mlp.6.weight")
     if first_w is None or last_w is None:
         raise RuntimeError("Unexpected fusion checkpoint format: missing mlp weights.")
-    in_dim = first_w.shape[1]
+
     hidden = first_w.shape[0]
     fused_dim = last_w.shape[0]
 
-    fusion_model = FusionEncoder(in_dim=in_dim, fused_dim=fused_dim, hidden=hidden, p_drop=0.2)
+    # Определяем реальную размерность на входе (CLAP audio + bi-encoder text)
+    # CLAP: 512, bi-encoder: 1024 = 1536 total
+    expected_in_dim = 1536
+    actual_in_dim = first_w.shape[1]
+
+    if actual_in_dim != expected_in_dim:
+        print(f"Warning: Fusion model has in_dim={actual_in_dim}, expected {expected_in_dim}")
+        print(f"Trimming first layer weights from {first_w.shape} to ({hidden}, {expected_in_dim})")
+        # Обрезаем веса и bias до нужной размерности
+        state_dict["mlp.0.weight"] = first_w[:, :expected_in_dim].clone()
+        if first_b is not None:
+            state_dict["mlp.0.bias"] = first_b.clone()  # bias не меняется
+        actual_in_dim = expected_in_dim
+
+    fusion_model = FusionEncoder(in_dim=actual_in_dim, fused_dim=fused_dim, hidden=hidden, p_drop=0.0)
     fusion_model.load_state_dict(state_dict)
     fusion_model.to(device).eval()
     return fusion_model
